@@ -12,6 +12,7 @@ from flask import (
 )
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
+from werkzeug.middleware.proxy_fix import ProxyFix
 import requests
 
 import cv2
@@ -27,10 +28,13 @@ from googleapiclient.http import MediaIoBaseUpload
 # Configuration
 # -------------------------------------------------------------
 app = Flask(__name__)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 app.secret_key = os.environ.get("SECRET_KEY", "studioface_prod_secret_key_2026_x99")
 
-# Loads securely from Render Environment Variables
+# Secure Environment Configuration
 BREVO_API_KEY = os.environ.get("BREVO_API_KEY", "")
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 
 os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
 
@@ -133,6 +137,24 @@ def send_email_otp(recipient_email, otp):
     except Exception as e:
         print(f"[Brevo Exception]: {str(e)}")
         return False, str(e)
+
+# -------------------------------------------------------------
+# Face Recognition & Detection Helper
+# -------------------------------------------------------------
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+
+def detect_faces(image_bytes):
+    try:
+        np_arr = np.frombuffer(image_bytes, np.uint8)
+        img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        if img is None:
+            return []
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40))
+        return faces
+    except Exception as e:
+        print(f"[Face Detection Error]: {e}")
+        return []
 
 # -------------------------------------------------------------
 # Google Drive Integration Helpers
@@ -361,17 +383,18 @@ def create_event():
 # -------------------------------------------------------------
 # Google OAuth Integration Routes
 # -------------------------------------------------------------
+@app.route('/connect-google')
 @app.route('/auth/google/connect')
 def google_connect():
     if 'client_id' not in session:
         return redirect(url_for('client_login'))
 
-    redirect_uri = url_for('oauth2callback', _external=True)
+    redirect_uri = url_for('oauth2callback', _external=True, _scheme='https')
     
     client_config = {
         "web": {
-            "client_id": os.environ.get("GOOGLE_CLIENT_ID", ""),
-            "client_secret": os.environ.get("GOOGLE_CLIENT_SECRET", ""),
+            "client_id": GOOGLE_CLIENT_ID or os.environ.get("GOOGLE_CLIENT_ID", ""),
+            "client_secret": GOOGLE_CLIENT_SECRET or os.environ.get("GOOGLE_CLIENT_SECRET", ""),
             "auth_uri": "https://accounts.google.com/o/oauth2/auth",
             "token_uri": "https://oauth2.googleapis.com/token"
         }
@@ -395,11 +418,11 @@ def oauth2callback():
     if 'client_id' not in session:
         return redirect(url_for('client_login'))
 
-    redirect_uri = url_for('oauth2callback', _external=True)
+    redirect_uri = url_for('oauth2callback', _external=True, _scheme='https')
     client_config = {
         "web": {
-            "client_id": os.environ.get("GOOGLE_CLIENT_ID", ""),
-            "client_secret": os.environ.get("GOOGLE_CLIENT_SECRET", ""),
+            "client_id": GOOGLE_CLIENT_ID or os.environ.get("GOOGLE_CLIENT_ID", ""),
+            "client_secret": GOOGLE_CLIENT_SECRET or os.environ.get("GOOGLE_CLIENT_SECRET", ""),
             "auth_uri": "https://accounts.google.com/o/oauth2/auth",
             "token_uri": "https://oauth2.googleapis.com/token"
         }
