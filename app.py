@@ -31,7 +31,7 @@ app.secret_key = os.environ.get("SECRET_KEY", "studioface_prod_secret_key_2026_x
 
 BREVO_API_KEY = os.environ.get(
     "BREVO_API_KEY",
-    "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"
+    "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"
 )
 
 os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
