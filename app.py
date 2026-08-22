@@ -30,12 +30,11 @@ app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 app.secret_key = os.environ.get("SECRET_KEY", "studioface_prod_secret_key_2026_x99")
 
+# Secure Environment Variables
 BREVO_API_KEY = os.environ.get("BREVO_API_KEY", "")
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
-
-# Master password for Admin Activity Portal
 ADMIN_SECRET_PIN = os.environ.get("ADMIN_SECRET_PIN", "admin@studioface2026")
 
 os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
@@ -47,11 +46,17 @@ OTP_STORE = {}
 SCOPES = ['https://www.googleapis.com/auth/drive.file']
 
 # -------------------------------------------------------------
+# Lightweight Keep-Alive Route (Prevents Render Sleep Mode)
+# -------------------------------------------------------------
+@app.route('/healthz')
+def health_check():
+    return "OK", 200
+
+# -------------------------------------------------------------
 # Database Abstraction (PostgreSQL / SQLite Auto-Switch)
 # -------------------------------------------------------------
 def get_db_connection():
     if DATABASE_URL and POSTGRES_AVAILABLE:
-        # Fix for SQLAlchemy/Render Postgres URI
         db_url = DATABASE_URL
         if db_url.startswith("postgres://"):
             db_url = db_url.replace("postgres://", "postgresql://", 1)
@@ -170,22 +175,27 @@ def send_email_otp(recipient_email, otp):
             "subject": f"Verification Code: {otp} - StudioFace",
             "htmlContent": f"""
             <div style="font-family: Arial, sans-serif; max-width: 440px; margin: auto; padding: 24px; background: #0F172A; border-radius: 16px; color: #F8FAFC; text-align: center;">
-                <h2 style="color: #6366F1;">StudioFace AI</h2>
-                <p style="color: #94A3B8;">Your verification OTP code is:</p>
+                <h2 style="color: #6366F1; margin-bottom: 10px;">StudioFace AI</h2>
+                <p style="color: #94A3B8;">Aapka verification OTP code hai:</p>
                 <div style="background: #1E293B; border-radius: 12px; padding: 18px; margin: 20px 0; border: 1px dashed #6366F1;">
-                    <span style="font-size: 32px; font-weight: 800; color: #818CF8; font-family: monospace;">{otp}</span>
+                    <span style="font-size: 32px; font-weight: 800; letter-spacing: 6px; color: #818CF8; font-family: monospace;">{otp}</span>
                 </div>
-                <p style="color: #64748B; font-size: 12px;">Valid for 10 minutes. Please do not share this code.</p>
+                <p style="color: #64748B; font-size: 12px;">Yeh code 10 minute ke liye valid hai.</p>
             </div>
             """
         }
         response = requests.post(url, headers=headers, json=payload, timeout=10)
-        return response.status_code in [200, 201, 202], response.text
+        if response.status_code in [200, 201, 202]:
+            return True, "OTP sent successfully."
+        else:
+            print(f"[Brevo Error] {response.status_code}: {response.text}")
+            return False, f"Email error: {response.text}"
     except Exception as e:
+        print(f"[Brevo Exception]: {str(e)}")
         return False, str(e)
 
 # -------------------------------------------------------------
-# Authentication Routes
+# Authentication & Public Routes
 # -------------------------------------------------------------
 @app.route('/')
 def index():
@@ -233,15 +243,51 @@ def client_signup():
         cursor.close()
         conn.close()
 
+@app.route('/client/login', methods=['GET', 'POST'])
+def client_login():
+    if request.method == 'GET':
+        return render_template('client_login.html')
+
+    email = request.form.get('email', '').strip().lower()
+    password = request.form.get('password', '')
+
+    conn, db_type = get_db_connection()
+    cursor = conn.cursor()
+    ph = "%s" if db_type == "POSTGRES" else "?"
+    cursor.execute(f"SELECT id, studio_name, password FROM clients WHERE email = {ph}", (email,))
+    user = cursor.fetchone()
+    cursor.close()
+    conn.close()
+
+    if user and check_password_hash(user[2], password):
+        session['client_id'] = user[0]
+        session['studio_name'] = user[1]
+        session['client_email'] = email
+        log_activity(email, "LOGIN_SUCCESS")
+        return redirect(url_for('client_dashboard'))
+    
+    log_activity(email, "LOGIN_FAILED")
+    return render_template('client_login.html', error="Invalid email or password.")
+
+@app.route('/client/logout')
+def client_logout():
+    email = session.get('client_email', 'unknown')
+    log_activity(email, "LOGOUT")
+    session.clear()
+    return redirect(url_for('client_login'))
+
+# -------------------------------------------------------------
+# OTP API Endpoints
+# -------------------------------------------------------------
 @app.route('/api/auth/send-otp', methods=['POST'])
 def api_send_otp():
     target = request.json.get('target', '').strip().lower()
     if not target or '@' not in target:
-        return jsonify({"success": False, "message": "Valid email is required."}), 400
+        return jsonify({"success": False, "message": "Valid email address is required."}), 400
 
     otp = str(random.randint(100000, 999999))
     OTP_STORE[target] = {"otp": otp, "time": datetime.datetime.now()}
-    log_activity(target, "OTP_REQUESTED", f"Code generated")
+    log_activity(target, "OTP_REQUESTED")
 
     success, msg = send_email_otp(target, otp)
     if success:
@@ -258,15 +304,50 @@ def api_verify_otp():
         session['verified_email'] = target
         log_activity(target, "OTP_VERIFIED_SUCCESS")
         return jsonify({"success": True, "message": "Email verified successfully."})
-    log_activity(target, "OTP_VERIFY_FAILED", f"Attempted code: {otp}")
+    
+    log_activity(target, "OTP_VERIFY_FAILED", f"Attempted OTP: {otp}")
     return jsonify({"success": False, "message": "Invalid or expired OTP."}), 400
+
+# -------------------------------------------------------------
+# Google OAuth & Dashboard Routes
+# -------------------------------------------------------------
+@app.route('/connect-google')
+@app.route('/auth/google/connect')
+def google_connect():
+    if 'client_id' not in session and 'studio_name' not in session:
+        return redirect(url_for('client_login'))
+
+    redirect_uri = url_for('oauth2callback', _external=True, _scheme='https')
+    client_config = {
+        "web": {
+            "client_id": GOOGLE_CLIENT_ID or os.environ.get("GOOGLE_CLIENT_ID", ""),
+            "client_secret": GOOGLE_CLIENT_SECRET or os.environ.get("GOOGLE_CLIENT_SECRET", ""),
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token"
+        }
+    }
+
+    try:
+        flow = Flow.from_client_config(client_config, scopes=SCOPES, redirect_uri=redirect_uri)
+        auth_url, state = flow.authorization_url(access_type='offline', include_granted_scopes='true', prompt='consent')
+        session['oauth_state'] = state
+        return redirect(auth_url)
+    except Exception as e:
+        return f"Google OAuth Config Error: {e}", 500
+
+@app.route('/oauth2callback')
+def oauth2callback():
+    return redirect(url_for('client_dashboard'))
+
+@app.route('/client/dashboard')
+def client_dashboard():
+    return render_template('client_dashboard.html', studio_name=session.get('studio_name'))
 
 # -------------------------------------------------------------
 # Master Activity & Admin Portal
 # -------------------------------------------------------------
 @app.route('/admin/activity', methods=['GET', 'POST'])
 def admin_activity():
-    # Passkey protection
     if request.method == 'POST':
         pin = request.form.get('pin', '')
         if pin == ADMIN_SECRET_PIN:
@@ -280,11 +361,9 @@ def admin_activity():
     conn, db_type = get_db_connection()
     cursor = conn.cursor()
 
-    # Fetch all registered clients
     cursor.execute("SELECT id, studio_name, owner_name, email, phone, created_at FROM clients ORDER BY id DESC")
     clients = cursor.fetchall()
 
-    # Fetch recent activity logs
     cursor.execute("SELECT id, email, action, details, ip_address, timestamp FROM activity_logs ORDER BY id DESC LIMIT 100")
     logs = cursor.fetchall()
 
@@ -294,17 +373,8 @@ def admin_activity():
     return render_template('admin_activity.html', authenticated=True, clients=clients, logs=logs)
 
 # -------------------------------------------------------------
-# Client Dashboard & Google Connect
+# Server Entry Point
 # -------------------------------------------------------------
-@app.route('/client/dashboard')
-def client_dashboard():
-    return render_template('client_dashboard.html', studio_name=session.get('studio_name'))
-
-@app.route('/connect-google')
-@app.route('/auth/google/connect')
-def google_connect():
-    return redirect("https://accounts.google.com")
-
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
