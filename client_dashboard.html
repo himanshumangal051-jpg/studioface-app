@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ studio_name }} | Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+</head>
+<body class="text-slate-100 min-h-screen bg-[#080c14]">
+    <nav class="border-b border-slate-800 bg-[#0F172A]/50 backdrop-blur px-8 py-4 flex justify-between items-center sticky top-0 z-50">
+        <div class="flex items-center gap-3">
+            <div class="h-9 w-9 bg-indigo-600 rounded-xl flex items-center justify-center font-bold text-white shadow-lg shadow-indigo-600/30">AI</div>
+            <span class="text-lg font-bold tracking-wide">{{ studio_name }}</span>
+        </div>
+        <a href="/client/logout" class="text-sm font-medium text-slate-400 hover:text-white transition">Sign Out</a>
+    </nav>
+
+    <main class="max-w-7xl mx-auto px-6 py-10">
+
+        <!-- Google Drive Integration Status Banner -->
+        {% if not is_drive_connected %}
+        <div class="glass-card border-2 border-amber-500/40 bg-amber-500/10 p-6 rounded-3xl mb-8 flex flex-col md:flex-row justify-between items-center gap-4">
+            <div class="flex items-center gap-4">
+                <div class="h-12 w-12 rounded-2xl bg-amber-500/20 text-amber-400 flex items-center justify-center text-2xl border border-amber-500/30">
+                    <i class="fa-brands fa-google-drive"></i>
+                </div>
+                <div>
+                    <h3 class="text-base font-bold text-white">Google Drive Not Connected!</h3>
+                    <p class="text-xs text-slate-400 mt-0.5">Photos client ke personal storage me save karne ke liye Google Drive connect karna zaroori hai.</p>
+                </div>
+            </div>
+            <a href="/connect-google" class="btn-glow px-6 py-3.5 rounded-xl text-xs font-bold whitespace-nowrap flex items-center gap-2 text-white">
+                <i class="fa-brands fa-google-drive text-base"></i> Connect My Google Drive
+            </a>
+        </div>
+        {% else %}
+        <div class="glass-card border border-emerald-500/30 bg-emerald-500/10 p-4 rounded-2xl mb-8 flex items-center justify-between">
+            <div class="flex items-center gap-3">
+                <i class="fa-solid fa-circle-check text-emerald-400 text-lg"></i>
+                <span class="text-xs font-semibold text-emerald-300">Google Drive Connected: Media is securely saving to your Google Drive under <strong>"StudioFace Events"</strong></span>
+            </div>
+            <span class="text-[10px] bg-emerald-500/20 text-emerald-400 px-3 py-1 rounded-full uppercase font-bold">Active Sync</span>
+        </div>
+        {% endif %}
+
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-8 mb-12">
+            <div class="lg:col-span-1 glass-card p-6 rounded-3xl">
+                <h2 class="text-xl font-bold mb-2">Create New Event</h2>
+                <p class="text-slate-400 text-xs mb-6">Upload photos, videos & audios to Google Drive.</p>
+
+                <form id="uploadForm" class="space-y-4">
+                    <div>
+                        <label class="text-xs font-semibold uppercase text-slate-400">Event Title</label>
+                        <input type="text" id="eventName" placeholder="e.g. Wedding Gala 2026" class="w-full bg-slate-900 border border-slate-700 rounded-xl p-3 mt-1.5 text-white outline-none focus:border-indigo-500" required>
+                    </div>
+                    <div>
+                        <label class="text-xs font-semibold uppercase text-slate-400">Select Media Files</label>
+                        <div id="dropZone" class="drop-zone border-2 border-dashed border-indigo-500/40 rounded-xl p-6 text-center cursor-pointer mt-1.5 bg-slate-900/60 hover:bg-slate-900 transition">
+                            <i class="fa-solid fa-cloud-arrow-up text-indigo-400 text-3xl mb-2"></i>
+                            <p class="text-sm text-slate-200 font-semibold" id="fileCount">Click to Browse or Drag Files</p>
+                            <input type="file" id="eventMedia" multiple accept="image/*,video/*,audio/*" class="hidden">
+                        </div>
+                    </div>
+                    <button type="submit" id="submitBtn" class="w-full btn-glow text-white font-medium py-3 rounded-xl flex items-center justify-center gap-2">
+                        <i class="fa-solid fa-cloud-upload"></i>
+                        <span>Upload to Google Drive</span>
+                    </button>
+                </form>
+                <div id="uploadLoader" class="hidden mt-4 text-center">
+                    <i class="fa-solid fa-circle-notch fa-spin text-indigo-500 text-2xl"></i>
+                    <p class="text-xs text-slate-300 mt-2 font-medium">Syncing files with Google Drive...</p>
+                </div>
+            </div>
+
+            <div class="lg:col-span-2 grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div class="glass-card p-6 rounded-3xl flex flex-col justify-between">
+                    <span class="text-slate-400 text-sm font-medium">Total Events Hosted</span>
+                    <h3 class="text-4xl font-extrabold text-white">{{ events|length }}</h3>
+                    <span class="text-xs text-indigo-400"><i class="fa-solid fa-cloud"></i> Client's Google Drive Storage</span>
+                </div>
+                <div class="glass-card p-6 rounded-3xl flex flex-col justify-between">
+                    <span class="text-slate-400 text-sm font-medium">Drive Sync Status</span>
+                    <h3 class="text-4xl font-extrabold {% if is_drive_connected %}text-emerald-400{% else %}text-amber-400{% endif %}">
+                        {% if is_drive_connected %}Connected{% else %}Pending{% endif %}
+                    </h3>
+                    <span class="text-xs text-slate-500">Google Drive API</span>
+                </div>
+            </div>
+        </div>
+
+        <h2 class="text-2xl font-bold mb-6">Your Active Events</h2>
+        <div class="space-y-8">
+            {% for event in events %}
+            <div class="glass-card rounded-3xl p-6 relative" id="event-card-{{ event.id }}">
+                <div class="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 mb-6 pb-6 border-b border-slate-800">
+                    <div>
+                        <div class="flex items-center gap-2">
+                            <h3 class="text-xl font-bold">{{ event.name }}</h3>
+                            <span class="bg-indigo-500/20 text-indigo-300 text-xs px-2.5 py-0.5 rounded font-mono font-bold">{{ event.id }}</span>
+                        </div>
+                        <p class="text-xs text-slate-400 mt-1">
+                            📷 {{ event.photos|length }} Photos | 🎬 {{ event.videos|length }} Videos | 🎵 {{ event.audios|length }} Audios
+                        </p>
+                    </div>
+
+                    <div class="flex items-center gap-2 flex-wrap">
+                        <input type="text" readonly value="{{ request.host_url }}event/{{ event.id }}" class="bg-slate-900 border border-slate-700 text-xs text-indigo-300 px-3 py-2 rounded-xl w-52 md:w-60 link-input">
+                        <button class="copy-btn bg-slate-800 hover:bg-slate-700 px-3 py-2 rounded-xl text-xs border border-slate-700"><i class="fa-regular fa-copy"></i></button>
+                        
+                        <label class="bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-400 border border-indigo-500/30 px-3 py-2 rounded-xl text-xs font-semibold cursor-pointer flex items-center gap-1.5 transition">
+                            <i class="fa-solid fa-plus"></i> Add Media
+                            <input type="file" multiple accept="image/*,video/*,audio/*" class="hidden add-media-input" data-event-id="{{ event.id }}">
+                        </label>
+
+                        <button class="delete-event-btn bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/30 px-3 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition" data-event-id="{{ event.id }}">
+                            <i class="fa-solid fa-trash"></i> Delete Event
+                        </button>
+                    </div>
+                </div>
+
+                {% if event.photos %}
+                <div class="mb-6">
+                    <h4 class="text-xs font-semibold uppercase text-slate-400 mb-3">Drive Photos ({{ event.photos|length }})</h4>
+                    <div class="grid grid-cols-4 sm:grid-cols-6 md:grid-cols-8 lg:grid-cols-10 gap-3 max-h-48 overflow-y-auto p-2 bg-slate-900/40 rounded-2xl border border-slate-800/60">
+                        {% for photo in event.photos %}
+                        <div class="relative group rounded-xl overflow-hidden aspect-square border border-slate-800" id="media-box-{{ photo.id }}">
+                            <img src="/drive/file/{{ photo.drive_file_id }}" class="w-full h-full object-cover">
+                            <button class="delete-media-btn absolute inset-0 bg-red-950/80 text-red-300 opacity-0 group-hover:opacity-100 flex items-center justify-center transition text-sm" data-media-id="{{ photo.id }}">
+                                <i class="fa-solid fa-trash-can"></i>
+                            </button>
+                        </div>
+                        {% endfor %}
+                    </div>
+                </div>
+                {% endif %}
+
+                {% if event.videos or event.audios %}
+                <div class="mb-6 grid grid-cols-1 md:grid-cols-2 gap-4">
+                    {% if event.videos %}
+                    <div class="bg-slate-900/40 p-4 rounded-2xl border border-slate-800/60">
+                        <h4 class="text-xs font-semibold uppercase text-slate-400 mb-3">Drive Videos ({{ event.videos|length }})</h4>
+                        <div class="space-y-2 max-h-36 overflow-y-auto">
+                            {% for video in event.videos %}
+                            <div class="flex justify-between items-center bg-slate-800/40 p-2 rounded-xl text-xs" id="media-box-{{ video.id }}">
+                                <span class="truncate max-w-[200px]"><i class="fa-solid fa-video text-indigo-400 mr-2"></i>{{ video.filename }}</span>
+                                <button class="delete-media-btn text-red-400 hover:text-red-300" data-media-id="{{ video.id }}"><i class="fa-solid fa-trash"></i></button>
+                            </div>
+                            {% endfor %}
+                        </div>
+                    </div>
+                    {% endif %}
+
+                    {% if event.audios %}
+                    <div class="bg-slate-900/40 p-4 rounded-2xl border border-slate-800/60">
+                        <h4 class="text-xs font-semibold uppercase text-slate-400 mb-3">Drive Audios ({{ event.audios|length }})</h4>
+                        <div class="space-y-2 max-h-36 overflow-y-auto">
+                            {% for audio in event.audios %}
+                            <div class="flex justify-between items-center bg-slate-800/40 p-2 rounded-xl text-xs" id="media-box-{{ audio.id }}">
+                                <span class="truncate max-w-[200px]"><i class="fa-solid fa-music text-purple-400 mr-2"></i>{{ audio.filename }}</span>
+                                <button class="delete-media-btn text-red-400 hover:text-red-300" data-media-id="{{ audio.id }}"><i class="fa-solid fa-trash"></i></button>
+                            </div>
+                            {% endfor %}
+                        </div>
+                    </div>
+                    {% endif %}
+                </div>
+                {% endif %}
+
+                <div>
+                    <h4 class="text-xs font-semibold uppercase text-slate-400 mb-3">Guest Access Log</h4>
+                    <div class="bg-slate-900/60 rounded-xl overflow-x-auto border border-slate-800/60">
+                        <table class="w-full text-left text-xs text-slate-300">
+                            <thead class="bg-slate-800/40 text-slate-400">
+                                <tr>
+                                    <th class="p-3">Guest Name</th>
+                                    <th class="p-3">Phone</th>
+                                    <th class="p-3">Matched Photos</th>
+                                    <th class="p-3">Time</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {% for g in event.guests %}
+                                <tr class="border-t border-slate-800/60">
+                                    <td class="p-3 font-medium text-white">{{ g.name }}</td>
+                                    <td class="p-3">{{ g.phone }}</td>
+                                    <td class="p-3"><span class="bg-indigo-900/50 text-indigo-300 px-2 py-0.5 rounded">{{ g.matched_count }} photos</span></td>
+                                    <td class="p-3 text-slate-500">{{ g.created_at }}</td>
+                                </tr>
+                                {% else %}
+                                <tr><td colspan="4" class="p-3 text-center text-slate-500">No guests have searched yet.</td></tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+    </main>
+
+    <script>
+        const dropZone = document.getElementById('dropZone');
+        const fileInput = document.getElementById('eventMedia');
+        const fileCountText = document.getElementById('fileCount');
+        let selectedFiles = [];
+
+        dropZone.addEventListener('click', () => fileInput.click());
+
+        fileInput.addEventListener('change', (e) => {
+            if (e.target.files.length > 0) {
+                selectedFiles = Array.from(e.target.files);
+                fileCountText.innerHTML = `<span class="text-emerald-400 font-bold">${selectedFiles.length} Media Files Selected!</span>`;
+            }
+        });
+
+        dropZone.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            dropZone.classList.add('bg-indigo-950/40', 'border-indigo-400');
+        });
+
+        dropZone.addEventListener('dragleave', (e) => {
+            e.preventDefault();
+            dropZone.classList.remove('bg-indigo-950/40', 'border-indigo-400');
+        });
+
+        dropZone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            dropZone.classList.remove('bg-indigo-950/40', 'border-indigo-400');
+            if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+                selectedFiles = Array.from(e.dataTransfer.files);
+                fileInput.files = e.dataTransfer.files;
+                fileCountText.innerHTML = `<span class="text-emerald-400 font-bold">${selectedFiles.length} Files Dropped!</span>`;
+            }
+        });
+
+        document.getElementById('uploadForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            if (selectedFiles.length === 0 && (!fileInput.files || fileInput.files.length === 0)) {
+                alert("Please select media files first.");
+                return;
+            }
+
+            const btn = document.getElementById('submitBtn');
+            const loader = document.getElementById('uploadLoader');
+            btn.disabled = true;
+            loader.classList.remove('hidden');
+
+            const formData = new FormData();
+            formData.append('event_name', document.getElementById('eventName').value);
+            const filesToUpload = selectedFiles.length > 0 ? selectedFiles : fileInput.files;
+            for (let i = 0; i < filesToUpload.length; i++) {
+                formData.append('media_files', filesToUpload[i]);
+            }
+
+            try {
+                const response = await fetch('/api/create-event', { method: 'POST', body: formData });
+                const result = await response.json();
+                if (response.ok && result.success) {
+                    window.location.reload();
+                } else {
+                    alert(result.error || "Upload failed. Check Google Drive connection.");
+                    btn.disabled = false;
+                    loader.classList.add('hidden');
+                }
+            } catch (err) {
+                alert("Network error: " + err.message);
+                btn.disabled = false;
+                loader.classList.add('hidden');
+            }
+        });
+
+        document.querySelectorAll('.copy-btn').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                const input = e.currentTarget.parentElement.querySelector('.link-input');
+                navigator.clipboard.writeText(input.value);
+                alert('Event link copied!');
+            });
+        });
+
+        document.querySelectorAll('.add-media-input').forEach(input => {
+            input.addEventListener('change', async (e) => {
+                const eventId = e.target.getAttribute('data-event-id');
+                const files = e.target.files;
+                if (!files.length) return;
+
+                const formData = new FormData();
+                for (let i = 0; i < files.length; i++) {
+                    formData.append('media_files', files[i]);
+                }
+                const res = await fetch(`/api/event/${eventId}/add-media`, { method: 'POST', body: formData });
+                if (res.ok) window.location.reload();
+            });
+        });
+
+        document.querySelectorAll('.delete-media-btn').forEach(btn => {
+            btn.addEventListener('click', async (e) => {
+                const mediaId = e.currentTarget.getAttribute('data-media-id');
+                if (!confirm("Delete this media from Google Drive?")) return;
+                const res = await fetch(`/api/media/${mediaId}/delete`, { method: 'POST' });
+                if (res.ok) document.getElementById(`media-box-${mediaId}`).remove();
+            });
+        });
+
+        document.querySelectorAll('.delete-event-btn').forEach(btn => {
+            btn.addEventListener('click', async (e) => {
+                const eventId = e.currentTarget.getAttribute('data-event-id');
+                if (!confirm(`Delete entire event folder from Google Drive (${eventId})?`)) return;
+                const res = await fetch(`/api/event/${eventId}/delete`, { method: 'POST' });
+                if (res.ok) document.getElementById(`event-card-${eventId}`).remove();
+            });
+        });
+    </script>
+</body>
+</html>
