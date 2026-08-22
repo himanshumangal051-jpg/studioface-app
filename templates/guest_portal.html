@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ event_name }} | Guest Media Access</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+</head>
+<body class="min-h-screen flex flex-col items-center justify-center p-4 bg-[#080c14]">
+
+    <div id="formSection" class="glass-card p-8 rounded-3xl w-full max-w-md text-center">
+        <span class="text-[10px] bg-indigo-500/20 text-indigo-300 font-bold px-3 py-1 rounded-full uppercase tracking-wider border border-indigo-500/30">Event Access: {{ event_id }}</span>
+        <h1 class="text-2xl font-bold text-white mt-3 mb-1">{{ event_name }}</h1>
+        <p class="text-slate-400 text-xs mb-6">Enter your details and take a selfie to unlock your media from Google Drive.</p>
+
+        <form id="scanForm" class="space-y-4 text-left">
+            <div>
+                <label class="text-xs font-semibold text-slate-400 uppercase tracking-wider">Your Full Name</label>
+                <input type="text" id="name" required placeholder="e.g. Rohan Verma" class="w-full bg-slate-900 border border-slate-700 rounded-xl p-3.5 mt-1 text-white outline-none focus:border-indigo-500">
+            </div>
+
+            <div>
+                <label class="text-xs font-semibold text-slate-400 uppercase tracking-wider">WhatsApp / Mobile Number</label>
+                <input type="tel" id="phone" required placeholder="e.g. 9876543210" class="w-full bg-slate-900 border border-slate-700 rounded-xl p-3.5 mt-1 text-white outline-none focus:border-indigo-500">
+            </div>
+
+            <div>
+                <label class="text-xs font-semibold text-slate-400 uppercase tracking-wider">Face Scan (Selfie)</label>
+                <div class="flex gap-2 mt-1">
+                    <button type="button" onclick="startCamera()" class="flex-1 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs py-2.5 rounded-xl font-medium flex items-center justify-center gap-2 text-slate-200">
+                        <i class="fa-solid fa-camera"></i> Live WebCam
+                    </button>
+                    <label class="flex-1 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs py-2.5 rounded-xl font-medium text-center cursor-pointer flex items-center justify-center gap-2 text-slate-200">
+                        <i class="fa-solid fa-upload"></i> Upload
+                        <input type="file" id="selfie" accept="image/*" class="hidden" onchange="document.getElementById('selfiePreview').src = window.URL.createObjectURL(this.files[0]); document.getElementById('selfiePreview').classList.remove('hidden')">
+                    </label>
+                </div>
+            </div>
+
+            <div id="cameraContainer" class="hidden relative rounded-2xl overflow-hidden border border-indigo-500/50 mt-3">
+                <video id="cameraVideo" autoplay playsinline class="w-full h-48 object-cover"></video>
+                <button type="button" onclick="captureSelfie()" class="absolute bottom-2 left-1/2 -translate-x-1/2 bg-white text-slate-950 font-bold text-xs px-4 py-1.5 rounded-full shadow-lg">Capture Selfie</button>
+            </div>
+            <canvas id="cameraCanvas" class="hidden"></canvas>
+            <img id="selfiePreview" class="hidden h-20 w-20 rounded-xl object-cover border-2 border-indigo-500 mx-auto mt-2">
+
+            <button type="submit" id="scanBtn" class="w-full btn-glow text-white font-semibold py-3.5 rounded-xl mt-4">
+                Unlock My Photos & Media
+            </button>
+        </form>
+
+        <div id="loader" class="hidden py-8">
+            <i class="fa-solid fa-fingerprint fa-bounce text-indigo-400 text-4xl mb-3"></i>
+            <p class="text-sm font-medium text-slate-300">Searching your photos directly from Google Drive...</p>
+        </div>
+    </div>
+
+    <div id="gallerySection" class="hidden w-full max-w-6xl py-8">
+        <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 mb-8">
+            <div>
+                <h2 class="text-3xl font-bold text-white" id="userHeading"></h2>
+                <p class="text-slate-400 text-sm" id="matchSummary"></p>
+            </div>
+        </div>
+
+        <h3 class="text-xl font-bold mb-4 flex items-center gap-2 text-white"><i class="fa-solid fa-images text-indigo-400"></i> Your Matched Photos</h3>
+        <div id="photosGrid" class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-6 mb-12"></div>
+
+        <div id="videosSection" class="hidden mb-12">
+            <h3 class="text-xl font-bold mb-4 flex items-center gap-2 text-white"><i class="fa-solid fa-film text-indigo-400"></i> Event Videos</h3>
+            <div id="videosGrid" class="grid grid-cols-1 md:grid-cols-2 gap-6"></div>
+        </div>
+
+        <div id="audiosSection" class="hidden mb-12">
+            <h3 class="text-xl font-bold mb-4 flex items-center gap-2 text-white"><i class="fa-solid fa-music text-purple-400"></i> Event Audios</h3>
+            <div id="audiosGrid" class="grid grid-cols-1 md:grid-cols-2 gap-4"></div>
+        </div>
+    </div>
+
+    <script src="/static/js/main.js"></script>
+    <script>
+        const eventId = "{{ event_id }}";
+
+        document.getElementById('scanForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+
+            const selfieInput = document.getElementById('selfie');
+            if (!selfieInput.files.length) {
+                alert("Please take or upload a selfie first.");
+                return;
+            }
+
+            const btn = document.getElementById('scanBtn');
+            const loader = document.getElementById('loader');
+            btn.classList.add('hidden');
+            loader.classList.remove('hidden');
+
+            const formData = new FormData();
+            formData.append('name', document.getElementById('name').value);
+            formData.append('phone', document.getElementById('phone').value);
+            formData.append('selfie', selfieInput.files[0]);
+
+            const res = await fetch(`/api/event/${eventId}/scan`, { method: 'POST', body: formData });
+            const data = await res.json();
+            loader.classList.add('hidden');
+
+            if (data.success) {
+                document.getElementById('formSection').classList.add('hidden');
+                document.getElementById('gallerySection').classList.remove('hidden');
+                document.getElementById('userHeading').innerText = `Welcome, ${data.name}!`;
+                document.getElementById('matchSummary').innerText = `We found ${data.photos.length} photos matching your face.`;
+
+                const pGrid = document.getElementById('photosGrid');
+                pGrid.innerHTML = '';
+                if (data.photos.length === 0) {
+                    pGrid.innerHTML = `<div class="col-span-full text-center py-12 glass-card rounded-2xl text-slate-400">No photos matched your face. Check event videos below.</div>`;
+                } else {
+                    data.photos.forEach(item => {
+                        pGrid.innerHTML += `
+                            <div class="glass-card rounded-2xl overflow-hidden group">
+                                <img src="/drive/file/${item.id}" class="w-full h-60 object-cover group-hover:scale-105 transition duration-300">
+                                <div class="p-3">
+                                    <a href="/drive/file/${item.id}" download="${item.name}" class="block text-center bg-slate-800 hover:bg-slate-700 text-slate-200 py-2 rounded-xl text-xs font-semibold">Download Photo</a>
+                                </div>
+                            </div>
+                        `;
+                    });
+                }
+
+                if (data.videos.length > 0) {
+                    document.getElementById('videosSection').classList.remove('hidden');
+                    const vGrid = document.getElementById('videosGrid');
+                    vGrid.innerHTML = '';
+                    data.videos.forEach(v => {
+                        vGrid.innerHTML += `
+                            <div class="glass-card p-4 rounded-2xl">
+                                <video controls class="w-full h-52 rounded-xl bg-black mb-3">
+                                    <source src="/drive/file/${v.id}">
+                                </video>
+                                <a href="/drive/file/${v.id}" download="${v.name}" class="block text-center bg-slate-800 hover:bg-slate-700 py-2 rounded-xl text-xs font-medium"><i class="fa-solid fa-download mr-1"></i> Download Video</a>
+                            </div>
+                        `;
+                    });
+                }
+
+                if (data.audios.length > 0) {
+                    document.getElementById('audiosSection').classList.remove('hidden');
+                    const aGrid = document.getElementById('audiosGrid');
+                    aGrid.innerHTML = '';
+                    data.audios.forEach(a => {
+                        aGrid.innerHTML += `
+                            <div class="glass-card p-4 rounded-2xl flex flex-col justify-between">
+                                <p class="text-xs font-semibold mb-2 truncate text-slate-300"><i class="fa-solid fa-headphones mr-1 text-purple-400"></i> ${a.name}</p>
+                                <audio controls class="w-full mb-3">
+                                    <source src="/drive/file/${a.id}">
+                                </audio>
+                                <a href="/drive/file/${a.id}" download="${a.name}" class="block text-center bg-slate-800 hover:bg-slate-700 py-2 rounded-xl text-xs font-medium"><i class="fa-solid fa-download mr-1"></i> Download Audio</a>
+                            </div>
+                        `;
+                    });
+                }
+            } else {
+                alert(data.message || 'Scanning failed.');
+                btn.classList.remove('hidden');
+            }
+        });
+    </script>
+</body>
+</html>
