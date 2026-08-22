@@ -31,7 +31,7 @@ app.secret_key = os.environ.get("SECRET_KEY", "studioface_prod_secret_key_2026_x
 
 BREVO_API_KEY = os.environ.get(
     "BREVO_API_KEY",
-    "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"
+    "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"
 )
 
 os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
@@ -94,7 +94,7 @@ def init_db():
 init_db()
 
 # -------------------------------------------------------------
-# Brevo HTTP Email Dispatcher (Delivers to Any Email)
+# Brevo HTTP Email Dispatcher
 # -------------------------------------------------------------
 def send_email_otp(recipient_email, otp):
     try:
@@ -135,6 +135,24 @@ def send_email_otp(recipient_email, otp):
     except Exception as e:
         print(f"[Brevo Exception]: {str(e)}")
         return False, str(e)
+
+# -------------------------------------------------------------
+# Face Recognition & Detection Helper
+# -------------------------------------------------------------
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+
+def detect_faces(image_bytes):
+    try:
+        np_arr = np.frombuffer(image_bytes, np.uint8)
+        img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        if img is None:
+            return []
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40))
+        return faces
+    except Exception as e:
+        print(f"[Face Detection Error]: {e}")
+        return []
 
 # -------------------------------------------------------------
 # Google Drive Integration Helpers
