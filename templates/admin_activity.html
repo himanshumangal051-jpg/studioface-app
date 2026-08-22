@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Master Activity Control | StudioFace AI</title>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700&display=swap" rel="stylesheet">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Plus Jakarta Sans', sans-serif; }
+        body { background: #0B0F19; color: #F8FAFC; padding: 30px; }
+        .container { max-width: 1100px; margin: auto; }
+        h1 { color: #818CF8; font-size: 26px; margin-bottom: 20px; }
+        .card { background: #111827; border: 1px solid #1F2937; border-radius: 16px; padding: 24px; margin-bottom: 28px; }
+        table { width: 100%; border-collapse: collapse; margin-top: 14px; font-size: 13px; }
+        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #1F2937; }
+        th { color: #94A3B8; font-weight: 700; background: #1E293B; }
+        .tag { display: inline-block; padding: 4px 8px; border-radius: 6px; font-size: 11px; font-weight: 700; }
+        .tag-success { background: rgba(16, 185, 129, 0.2); color: #10B981; }
+        .tag-danger { background: rgba(239, 68, 68, 0.2); color: #EF4444; }
+        .tag-info { background: rgba(99, 102, 241, 0.2); color: #818CF8; }
+        .login-box { max-width: 360px; margin: 100px auto; background: #111827; padding: 30px; border-radius: 16px; text-align: center; border: 1px solid #1F2937; }
+        input { width: 100%; padding: 12px; background: #1F2937; border: 1px solid #374151; border-radius: 8px; color: #FFF; margin: 14px 0; outline: none; }
+        button { width: 100%; padding: 12px; background: #6366F1; color: #FFF; border: none; border-radius: 8px; font-weight: 700; cursor: pointer; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    {% if not authenticated %}
+    <div class="login-box">
+        <h2>Admin Access</h2>
+        <p style="color: #94A3B8; font-size: 13px; margin-top: 6px;">Enter master PIN to view live logs</p>
+        {% if error %}<p style="color: #EF4444; font-size: 12px; margin-top: 8px;">{{ error }}</p>{% endif %}
+        <form method="POST">
+            <input type="password" name="pin" placeholder="Enter Master PIN" required>
+            <button type="submit">Unlock Dashboard</button>
+        </form>
+    </div>
+    {% else %}
+    <h1>📊 StudioFace Live Activity & Client Registry</h1>
+
+    <!-- ALL REGISTERED CLIENTS -->
+    <div class="card">
+        <h3>Registered Studios (Total: {{ clients|length }})</h3>
+        <table>
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Studio Name</th>
+                    <th>Owner</th>
+                    <th>Email</th>
+                    <th>Mobile</th>
+                    <th>Joined At</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for c in clients %}
+                <tr>
+                    <td>#{{ c[0] }}</td>
+                    <td style="font-weight: 600; color: #FFF;">{{ c[1] }}</td>
+                    <td>{{ c[2] }}</td>
+                    <td style="color: #818CF8;">{{ c[3] }}</td>
+                    <td>{{ c[4] }}</td>
+                    <td style="color: #94A3B8;">{{ c[5] }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+
+    <!-- LIVE ACTIVITY LOGS -->
+    <div class="card">
+        <h3>Real-time User Activity Logs</h3>
+        <table>
+            <thead>
+                <tr>
+                    <th>Time</th>
+                    <th>User / Target</th>
+                    <th>Action</th>
+                    <th>Details</th>
+                    <th>IP Address</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for l in logs %}
+                <tr>
+                    <td style="color: #94A3B8;">{{ l[5] }}</td>
+                    <td>{{ l[1] or 'Guest / Visitor' }}</td>
+                    <td>
+                        {% if 'SUCCESS' in l[2] %}
+                            <span class="tag tag-success">{{ l[2] }}</span>
+                        {% elif 'FAILED' in l[2] or 'ERROR' in l[2] %}
+                            <span class="tag tag-danger">{{ l[2] }}</span>
+                        {% else %}
+                            <span class="tag tag-info">{{ l[2] }}</span>
+                        {% endif %}
+                    </td>
+                    <td style="color: #CBD5E1;">{{ l[3] }}</td>
+                    <td style="font-family: monospace; color: #94A3B8;">{{ l[4] }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% endif %}
+</div>
+
+</body>
+</html>
