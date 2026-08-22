@@ -16,6 +16,11 @@ from werkzeug.utils import secure_filename
 from werkzeug.middleware.proxy_fix import ProxyFix
 import requests
 
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import Flow
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
+
 try:
     import psycopg2
     from psycopg2.extras import RealDictCursor
@@ -30,7 +35,6 @@ app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 app.secret_key = os.environ.get("SECRET_KEY", "studioface_prod_secret_key_2026_x99")
 
-# Secure Environment Variables
 BREVO_API_KEY = os.environ.get("BREVO_API_KEY", "")
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
@@ -46,14 +50,14 @@ OTP_STORE = {}
 SCOPES = ['https://www.googleapis.com/auth/drive.file']
 
 # -------------------------------------------------------------
-# Lightweight Keep-Alive Route (Prevents Render Sleep Mode)
+# Lightweight Keep-Alive Route
 # -------------------------------------------------------------
 @app.route('/healthz')
 def health_check():
     return "OK", 200
 
 # -------------------------------------------------------------
-# Database Abstraction (PostgreSQL / SQLite Auto-Switch)
+# Database Connection Helper
 # -------------------------------------------------------------
 def get_db_connection():
     if DATABASE_URL and POSTGRES_AVAILABLE:
@@ -185,14 +189,49 @@ def send_email_otp(recipient_email, otp):
             """
         }
         response = requests.post(url, headers=headers, json=payload, timeout=10)
-        if response.status_code in [200, 201, 202]:
-            return True, "OTP sent successfully."
-        else:
-            print(f"[Brevo Error] {response.status_code}: {response.text}")
-            return False, f"Email error: {response.text}"
+        return response.status_code in [200, 201, 202], response.text
     except Exception as e:
-        print(f"[Brevo Exception]: {str(e)}")
         return False, str(e)
+
+# -------------------------------------------------------------
+# Google Drive Helper Functions
+# -------------------------------------------------------------
+def get_drive_service(client_id):
+    conn, db_type = get_db_connection()
+    cursor = conn.cursor()
+    ph = "%s" if db_type == "POSTGRES" else "?"
+    cursor.execute(f"SELECT google_tokens FROM clients WHERE id = {ph}", (client_id,))
+    row = cursor.fetchone()
+    cursor.close()
+    conn.close()
+
+    if not row or not row[0]:
+        return None
+
+    token_info = json.loads(row[0])
+    creds = Credentials(
+        token=token_info.get('token'),
+        refresh_token=token_info.get('refresh_token'),
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=token_info.get('client_id'),
+        client_secret=token_info.get('client_secret'),
+        scopes=SCOPES
+    )
+    return build('drive', 'v3', credentials=creds)
+
+def get_or_create_root_folder(service):
+    query = "name = 'StudioFace Events' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+    results = service.files().list(q=query, spaces='drive', fields='files(id, name)').execute()
+    files = results.get('files', [])
+    if files:
+        return files[0]['id']
+    
+    folder_metadata = {
+        'name': 'StudioFace Events',
+        'mimeType': 'application/vnd.google-apps.folder'
+    }
+    folder = service.files().create(body=folder_metadata, fields='id').execute()
+    return folder.get('id')
 
 # -------------------------------------------------------------
 # Authentication & Public Routes
@@ -314,7 +353,7 @@ def api_verify_otp():
 @app.route('/connect-google')
 @app.route('/auth/google/connect')
 def google_connect():
-    if 'client_id' not in session and 'studio_name' not in session:
+    if 'client_id' not in session:
         return redirect(url_for('client_login'))
 
     redirect_uri = url_for('oauth2callback', _external=True, _scheme='https')
@@ -337,11 +376,66 @@ def google_connect():
 
 @app.route('/oauth2callback')
 def oauth2callback():
+    if 'client_id' not in session:
+        return redirect(url_for('client_login'))
+
+    redirect_uri = url_for('oauth2callback', _external=True, _scheme='https')
+    client_config = {
+        "web": {
+            "client_id": GOOGLE_CLIENT_ID or os.environ.get("GOOGLE_CLIENT_ID", ""),
+            "client_secret": GOOGLE_CLIENT_SECRET or os.environ.get("GOOGLE_CLIENT_SECRET", ""),
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token"
+        }
+    }
+
+    flow = Flow.from_client_config(
+        client_config,
+        scopes=SCOPES,
+        state=session.get('oauth_state'),
+        redirect_uri=redirect_uri
+    )
+    flow.fetch_token(authorization_response=request.url)
+    creds = flow.credentials
+
+    token_data = {
+        'token': creds.token,
+        'refresh_token': creds.refresh_token,
+        'client_id': creds.client_id,
+        'client_secret': creds.client_secret,
+        'scopes': creds.scopes
+    }
+
+    conn, db_type = get_db_connection()
+    cursor = conn.cursor()
+    ph = "%s" if db_type == "POSTGRES" else "?"
+    cursor.execute(f"UPDATE clients SET google_tokens = {ph} WHERE id = {ph}", (json.dumps(token_data), session['client_id']))
+    conn.commit()
+    cursor.close()
+    conn.close()
+
     return redirect(url_for('client_dashboard'))
 
 @app.route('/client/dashboard')
 def client_dashboard():
-    return render_template('client_dashboard.html', studio_name=session.get('studio_name'))
+    if 'client_id' not in session:
+        return redirect(url_for('client_login'))
+
+    client_id = session['client_id']
+    conn, db_type = get_db_connection()
+    cursor = conn.cursor()
+    ph = "%s" if db_type == "POSTGRES" else "?"
+
+    cursor.execute(f"SELECT google_tokens, studio_name FROM clients WHERE id = {ph}", (client_id,))
+    client_row = cursor.fetchone()
+    has_drive = bool(client_row and client_row[0])
+
+    cursor.execute(f"SELECT id, event_id, event_name, event_date, created_at FROM events WHERE client_id = {ph} ORDER BY id DESC", (client_id,))
+    events = cursor.fetchall()
+    cursor.close()
+    conn.close()
+
+    return render_template('client_dashboard.html', studio_name=session.get('studio_name'), has_drive=has_drive, events=events)
 
 # -------------------------------------------------------------
 # Master Activity & Admin Portal
