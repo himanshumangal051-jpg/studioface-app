@@ -24,33 +24,31 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
 # -------------------------------------------------------------
-# Configuration & Setup
+# Configuration
 # -------------------------------------------------------------
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "studioface_prod_secret_key_2026_x99")
 
-RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "re_bBJVBPnc_HL52Piucqwz9qKs7e8tLnCzb")
+BREVO_API_KEY = os.environ.get(
+    "BREVO_API_KEY",
+    "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"
+)
 
-# Allow HTTP for local testing; Render handles HTTPS termination automatically
 os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
 
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 DB_PATH = os.path.join(BASE_DIR, 'face_engine.db')
 
-# In-memory store for email verification OTPs
 OTP_STORE = {}
-
-# Google OAuth Scopes for Drive
 SCOPES = ['https://www.googleapis.com/auth/drive.file']
 
 # -------------------------------------------------------------
-# Database Initialization
+# Database Setup
 # -------------------------------------------------------------
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
-    # Studio / Client Table
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS clients (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -64,7 +62,6 @@ def init_db():
         )
     ''')
 
-    # Events Table
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -78,7 +75,6 @@ def init_db():
         )
     ''')
 
-    # Media / Photos Table
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS event_media (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -98,64 +94,50 @@ def init_db():
 init_db()
 
 # -------------------------------------------------------------
-# Email OTP Helper (Via Resend HTTP API)
+# Brevo HTTP Email Dispatcher (Delivers to Any Email)
 # -------------------------------------------------------------
 def send_email_otp(recipient_email, otp):
     try:
-        url = "https://api.resend.com/emails"
+        url = "https://api.brevo.com/v3/smtp/email"
         headers = {
-            "Authorization": f"Bearer {RESEND_API_KEY}",
-            "Content-Type": "application/json"
+            "api-key": BREVO_API_KEY,
+            "Content-Type": "application/json",
+            "Accept": "application/json"
         }
         
-        html_content = f"""
-        <div style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; max-width: 460px; margin: 0 auto; background: #0F172A; border-radius: 16px; padding: 32px; color: #F8FAFC; text-align: center; border: 1px solid #1E293B;">
-            <h2 style="color: #6366F1; margin: 0 0 8px; font-size: 26px;">StudioFace AI</h2>
-            <p style="color: #94A3B8; font-size: 14px; margin-bottom: 24px;">Your One-Time Password for Verification</p>
-            <div style="background: #1E293B; border-radius: 12px; padding: 18px; margin: 20px 0; border: 1px dashed #6366F1;">
-                <span style="font-size: 36px; font-weight: 800; letter-spacing: 8px; color: #818CF8; font-family: monospace;">{otp}</span>
-            </div>
-            <p style="color: #64748B; font-size: 12px; margin-top: 24px;">Valid for 10 minutes. If you did not request this code, please ignore this email.</p>
-        </div>
-        """
-        
         payload = {
-            "from": "StudioFace <onboarding@resend.dev>",
-            "to": [recipient_email],
+            "sender": {
+                "name": "StudioFace AI",
+                "email": "himanshumangal051@gmail.com"
+            },
+            "to": [
+                {"email": recipient_email}
+            ],
             "subject": f"Verification Code: {otp} - StudioFace",
-            "html": html_content
+            "htmlContent": f"""
+            <div style="font-family: Arial, sans-serif; max-width: 440px; margin: auto; padding: 24px; background: #0F172A; border-radius: 16px; color: #F8FAFC; text-align: center;">
+                <h2 style="color: #6366F1; margin: 0 0 10px;">StudioFace AI</h2>
+                <p style="color: #94A3B8; font-size: 14px;">Your verification OTP code is:</p>
+                <div style="background: #1E293B; border-radius: 12px; padding: 18px; margin: 20px 0; border: 1px dashed #6366F1;">
+                    <span style="font-size: 32px; font-weight: 800; letter-spacing: 6px; color: #818CF8; font-family: monospace;">{otp}</span>
+                </div>
+                <p style="color: #64748B; font-size: 12px;">Valid for 10 minutes. Please do not share this code.</p>
+            </div>
+            """
         }
 
         response = requests.post(url, headers=headers, json=payload, timeout=10)
-        if response.status_code in [200, 201]:
+        if response.status_code in [200, 201, 202]:
             return True, "OTP sent successfully."
         else:
-            print(f"[Resend Error] {response.status_code}: {response.text}")
-            return False, f"Email sending error: {response.text}"
+            print(f"[Brevo Error] {response.status_code}: {response.text}")
+            return False, f"Email error: {response.text}"
     except Exception as e:
-        print(f"[Resend Exception]: {str(e)}")
+        print(f"[Brevo Exception]: {str(e)}")
         return False, str(e)
 
 # -------------------------------------------------------------
-# Face Recognition & Matching Engine
-# -------------------------------------------------------------
-face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-
-def detect_faces(image_bytes):
-    try:
-        np_arr = np.frombuffer(image_bytes, np.uint8)
-        img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-        if img is None:
-            return []
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40))
-        return faces
-    except Exception as e:
-        print(f"[Face Detection Error]: {e}")
-        return []
-
-# -------------------------------------------------------------
-# Google Drive Helper Functions
+# Google Drive Integration Helpers
 # -------------------------------------------------------------
 def get_drive_service(client_id):
     conn = sqlite3.connect(DB_PATH)
@@ -206,14 +188,19 @@ def client_signup():
     
     data = request.form
     studio_name = data.get('studio_name', '').strip()
-    owner_name = data.get('owner_name', '').strip()
+    owner_name = data.get('owner_name', '').strip() or studio_name
     email = data.get('email', '').strip().lower()
     phone = data.get('phone', '').strip()
     password = data.get('password', '')
     otp = data.get('otp', '').strip()
 
-    # Verify OTP
-    if email not in OTP_STORE or OTP_STORE[email]['otp'] != otp:
+    is_valid_otp = False
+    if session.get('verified_email') == email:
+        is_valid_otp = True
+    elif email in OTP_STORE and OTP_STORE[email].get('otp') == otp:
+        is_valid_otp = True
+
+    if not is_valid_otp:
         return render_template('client_signup.html', error="Invalid or expired OTP. Please verify your email again.")
 
     hashed_pw = generate_password_hash(password)
@@ -232,6 +219,7 @@ def client_signup():
         session['client_id'] = client_id
         session['studio_name'] = studio_name
         OTP_STORE.pop(email, None)
+        session.pop('verified_email', None)
         return redirect(url_for('client_dashboard'))
     except sqlite3.IntegrityError:
         return render_template('client_signup.html', error="An account with this email already exists.")
@@ -271,7 +259,7 @@ def client_forgot_password():
     otp = request.form.get('otp', '').strip()
     new_password = request.form.get('new_password', '')
 
-    if email not in OTP_STORE or OTP_STORE[email]['otp'] != otp:
+    if session.get('verified_email') != email and (email not in OTP_STORE or OTP_STORE[email]['otp'] != otp):
         return render_template('client_forgot_password.html', error="Invalid or expired OTP.")
 
     hashed_pw = generate_password_hash(new_password)
@@ -282,10 +270,11 @@ def client_forgot_password():
     conn.close()
 
     OTP_STORE.pop(email, None)
+    session.pop('verified_email', None)
     return redirect(url_for('client_login'))
 
 # -------------------------------------------------------------
-# REST API for OTP Verification
+# Verification API Routes
 # -------------------------------------------------------------
 @app.route('/api/auth/send-otp', methods=['POST'])
 def api_send_otp():
@@ -299,7 +288,7 @@ def api_send_otp():
     success, msg = send_email_otp(target, generated_otp)
     if success:
         return jsonify({"success": True, "message": "OTP has been sent to your email inbox."})
-    return jsonify({"success": False, "message": msg}), 500
+    return jsonify({"success": False, "message": msg}), 400
 
 @app.route('/api/auth/verify-otp', methods=['POST'])
 def api_verify_otp():
@@ -308,6 +297,7 @@ def api_verify_otp():
     otp = data.get('otp', '').strip()
 
     if target in OTP_STORE and OTP_STORE[target]['otp'] == otp:
+        session['verified_email'] = target
         return jsonify({"success": True, "message": "Email verified successfully."})
     return jsonify({"success": False, "message": "Invalid or expired OTP."}), 400
 
@@ -378,7 +368,6 @@ def google_connect():
     if 'client_id' not in session:
         return redirect(url_for('client_login'))
 
-    # Host-aware redirect URL for production Render & localhost
     redirect_uri = url_for('oauth2callback', _external=True)
     
     client_config = {
@@ -444,7 +433,7 @@ def oauth2callback():
     return redirect(url_for('client_dashboard'))
 
 # -------------------------------------------------------------
-# Guest Portal & Face Matching
+# Guest Portal Route
 # -------------------------------------------------------------
 @app.route('/guest/<event_id>')
 def guest_portal(event_id):
@@ -460,7 +449,7 @@ def guest_portal(event_id):
     return render_template('guest_portal.html', event_id=event_id, event_name=event[0], event_date=event[1])
 
 # -------------------------------------------------------------
-# Entry Point
+# Server Entry Point
 # -------------------------------------------------------------
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
