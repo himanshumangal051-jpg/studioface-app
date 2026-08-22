@@ -1,9 +1,0 @@
-flask==3.0.3
-opencv-python-headless==4.10.0.84
-numpy==1.26.4
-Pillow==10.3.0
-werkzeug==3.0.3
-gunicorn==21.2.0
-google-auth-oauthlib==1.2.1
-google-api-python-client==2.140.0
-google-auth-httplib2==0.2.0
