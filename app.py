@@ -1,613 +1,467 @@
 import os
-import io
+import sys
 import json
-import uuid
 import random
 import sqlite3
-import smtplib
-import ssl
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-import numpy as np
-import cv2
-from flask import Flask, render_template, request, redirect, url_for, session, jsonify, send_file
-from werkzeug.utils import secure_filename
+import datetime
+from io import BytesIO
+
+from flask import (
+    Flask, render_template, request, redirect,
+    url_for, session, jsonify, send_file
+)
 from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
+import requests
 
-# Google Drive API Client Libraries
-import google_auth_oauthlib.flow
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
+import cv2
+import numpy as np
+from PIL import Image
+
 from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import Flow
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
 
-# Bypass HTTPS restriction for local testing
+# -------------------------------------------------------------
+# Configuration & Setup
+# -------------------------------------------------------------
+app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", "studioface_prod_secret_key_2026_x99")
+
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "re_bBJVBPnc_HL52Piucqwz9qKs7e8tLnCzb")
+
+# Allow HTTP for local testing; Render handles HTTPS termination automatically
 os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
 
-app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "studio_prod_auth_secret_2026")
+BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+DB_PATH = os.path.join(BASE_DIR, 'face_engine.db')
 
-DB_PATH = 'face_engine.db'
+# In-memory store for email verification OTPs
+OTP_STORE = {}
 
-# ==========================================
-# 📧 EMAIL SMTP CONFIGURATION
-# ==========================================
-EMAIL_SENDER = "himanshumangal051@gmail.com"
-EMAIL_PASSWORD = "wyghfrfqnabsfpel"
-
-# ==========================================
-# 📂 GOOGLE OAUTH CREDENTIALS
-# ==========================================
-GOOGLE_CLIENT_ID = "92917705295-uj4k5a7t1hpvj6cgem42np1i9qgqsnto.apps.googleusercontent.com"
-GOOGLE_CLIENT_SECRET = "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"
+# Google OAuth Scopes for Drive
 SCOPES = ['https://www.googleapis.com/auth/drive.file']
 
-# Safe Face Detector Loader
-cascade_filename = 'haarcascade_frontalface_default.xml'
-cascade_path = getattr(cv2, 'data', None)
-if cascade_path and hasattr(cascade_path, 'haarcascades'):
-    model_path = os.path.join(cv2.data.haarcascades, cascade_filename)
-else:
-    model_path = os.path.join(os.path.dirname(cv2.__file__), 'data', cascade_filename)
-
-if not os.path.exists(model_path):
-    model_path = cv2.samples.findFile(cascade_filename) if hasattr(cv2, 'samples') else cascade_filename
-
-face_cascade = cv2.CascadeClassifier(model_path)
-
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
+# -------------------------------------------------------------
+# Database Initialization
+# -------------------------------------------------------------
 def init_db():
-    with get_db() as conn:
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS clients (
-                id TEXT PRIMARY KEY,
-                studio_name TEXT NOT NULL,
-                email TEXT UNIQUE NOT NULL,
-                phone TEXT NOT NULL,
-                shop_address TEXT NOT NULL,
-                password_hash TEXT NOT NULL,
-                google_credentials TEXT DEFAULT '',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        cursor = conn.execute("PRAGMA table_info(clients)")
-        cols = [c['name'] for c in cursor.fetchall()]
-        if 'phone' not in cols:
-            conn.execute("ALTER TABLE clients ADD COLUMN phone TEXT DEFAULT ''")
-        if 'shop_address' not in cols:
-            conn.execute("ALTER TABLE clients ADD COLUMN shop_address TEXT DEFAULT ''")
-        if 'google_credentials' not in cols:
-            conn.execute("ALTER TABLE clients ADD COLUMN google_credentials TEXT DEFAULT ''")
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
 
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS events (
-                id TEXT PRIMARY KEY,
-                client_id TEXT,
-                name TEXT NOT NULL,
-                drive_folder_id TEXT DEFAULT '',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY(client_id) REFERENCES clients(id)
-            )
-        ''')
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS media_items (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_id TEXT,
-                filename TEXT NOT NULL,
-                media_type TEXT NOT NULL,
-                drive_file_id TEXT DEFAULT '',
-                FOREIGN KEY(event_id) REFERENCES events(id)
-            )
-        ''')
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS guest_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_id TEXT,
-                name TEXT,
-                phone TEXT,
-                matched_count INTEGER,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        conn.commit()
+    # Studio / Client Table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS clients (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            studio_name TEXT NOT NULL,
+            owner_name TEXT NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            phone TEXT NOT NULL,
+            password TEXT NOT NULL,
+            google_tokens TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
+    # Events Table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            client_id INTEGER NOT NULL,
+            event_id TEXT UNIQUE NOT NULL,
+            event_name TEXT NOT NULL,
+            event_date TEXT NOT NULL,
+            drive_folder_id TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (client_id) REFERENCES clients (id)
+        )
+    ''')
+
+    # Media / Photos Table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS event_media (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id TEXT NOT NULL,
+            drive_file_id TEXT NOT NULL,
+            file_name TEXT NOT NULL,
+            file_type TEXT NOT NULL,
+            thumbnail_url TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (event_id) REFERENCES events (event_id)
+        )
+    ''')
+
+    conn.commit()
+    conn.close()
 
 init_db()
 
-OTP_STORE = {}
-
+# -------------------------------------------------------------
+# Email OTP Helper (Via Resend HTTP API)
+# -------------------------------------------------------------
 def send_email_otp(recipient_email, otp):
-    msg = MIMEMultipart("alternative")
-    msg['From'] = f"StudioFace Security <{EMAIL_SENDER}>"
-    msg['To'] = recipient_email
-    msg['Subject'] = f"Verification Code: {otp} - StudioFace"
-
-    html = f"""
-    <div style="font-family: Arial, sans-serif; max-width: 440px; margin: auto; padding: 24px; background: #0F172A; border-radius: 16px; color: #F8FAFC; text-align: center;">
-        <h2 style="color: #6366F1; margin: 0 0 10px;">StudioFace AI</h2>
-        <p style="color: #94A3B8; font-size: 13px;">Your email verification OTP is:</p>
-        <div style="background: #1E293B; border-radius: 12px; padding: 18px; margin: 20px 0; border: 1px dashed #6366F1;">
-            <span style="font-size: 32px; font-weight: 800; letter-spacing: 6px; color: #818CF8; font-family: monospace;">{otp}</span>
-        </div>
-        <p style="color: #64748B; font-size: 11px;">Valid for 10 minutes. Do not share with anyone.</p>
-    </div>
-    """
-    msg.attach(MIMEText(html, 'html'))
-
     try:
-        context = ssl.create_default_context()
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context, timeout=10) as server:
-            server.login(EMAIL_SENDER, EMAIL_PASSWORD)
-            server.sendmail(EMAIL_SENDER, recipient_email, msg.as_string())
-        return True, "Success"
-    except Exception:
-        try:
-            with smtplib.SMTP("smtp.gmail.com", 587, timeout=10) as server:
-                server.starttls()
-                server.login(EMAIL_SENDER, EMAIL_PASSWORD)
-                server.sendmail(EMAIL_SENDER, recipient_email, msg.as_string())
-            return True, "Success"
-        except Exception as e:
-            return False, str(e)
+        url = "https://api.resend.com/emails"
+        headers = {
+            "Authorization": f"Bearer {RESEND_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        html_content = f"""
+        <div style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; max-width: 460px; margin: 0 auto; background: #0F172A; border-radius: 16px; padding: 32px; color: #F8FAFC; text-align: center; border: 1px solid #1E293B;">
+            <h2 style="color: #6366F1; margin: 0 0 8px; font-size: 26px;">StudioFace AI</h2>
+            <p style="color: #94A3B8; font-size: 14px; margin-bottom: 24px;">Your One-Time Password for Verification</p>
+            <div style="background: #1E293B; border-radius: 12px; padding: 18px; margin: 20px 0; border: 1px dashed #6366F1;">
+                <span style="font-size: 36px; font-weight: 800; letter-spacing: 8px; color: #818CF8; font-family: monospace;">{otp}</span>
+            </div>
+            <p style="color: #64748B; font-size: 12px; margin-top: 24px;">Valid for 10 minutes. If you did not request this code, please ignore this email.</p>
+        </div>
+        """
+        
+        payload = {
+            "from": "StudioFace <onboarding@resend.dev>",
+            "to": [recipient_email],
+            "subject": f"Verification Code: {otp} - StudioFace",
+            "html": html_content
+        }
 
-# --- GOOGLE DRIVE HELPER FUNCTIONS ---
+        response = requests.post(url, headers=headers, json=payload, timeout=10)
+        if response.status_code in [200, 201]:
+            return True, "OTP sent successfully."
+        else:
+            print(f"[Resend Error] {response.status_code}: {response.text}")
+            return False, f"Email sending error: {response.text}"
+    except Exception as e:
+        print(f"[Resend Exception]: {str(e)}")
+        return False, str(e)
 
-def get_client_drive_service(client_id):
-    with get_db() as conn:
-        client = conn.execute("SELECT google_credentials FROM clients WHERE id = ?", (client_id,)).fetchone()
-        if not client or not client['google_credentials']:
-            return None
-        creds_data = json.loads(client['google_credentials'])
-        creds = Credentials.from_authorized_user_info(creds_data, SCOPES)
-        return build('drive', 'v3', credentials=creds)
+# -------------------------------------------------------------
+# Face Recognition & Matching Engine
+# -------------------------------------------------------------
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
-def get_or_create_folder(drive_service, folder_name, parent_id=None):
-    query = f"name = '{folder_name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-    if parent_id:
-        query += f" and '{parent_id}' in parents"
+def detect_faces(image_bytes):
+    try:
+        np_arr = np.frombuffer(image_bytes, np.uint8)
+        img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        if img is None:
+            return []
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40))
+        return faces
+    except Exception as e:
+        print(f"[Face Detection Error]: {e}")
+        return []
+
+# -------------------------------------------------------------
+# Google Drive Helper Functions
+# -------------------------------------------------------------
+def get_drive_service(client_id):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT google_tokens FROM clients WHERE id = ?", (client_id,))
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row or not row[0]:
+        return None
+
+    token_info = json.loads(row[0])
+    creds = Credentials(
+        token=token_info.get('token'),
+        refresh_token=token_info.get('refresh_token'),
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=token_info.get('client_id'),
+        client_secret=token_info.get('client_secret'),
+        scopes=SCOPES
+    )
+    return build('drive', 'v3', credentials=creds)
+
+def get_or_create_root_folder(service):
+    query = "name = 'StudioFace Events' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+    results = service.files().list(q=query, spaces='drive', fields='files(id, name)').execute()
+    files = results.get('files', [])
+    if files:
+        return files[0]['id']
     
-    results = drive_service.files().list(q=query, spaces='drive', fields='files(id, name)').execute()
-    items = results.get('files', [])
-    if items:
-        return items[0]['id']
-
-    file_metadata = {
-        'name': folder_name,
+    folder_metadata = {
+        'name': 'StudioFace Events',
         'mimeType': 'application/vnd.google-apps.folder'
     }
-    if parent_id:
-        file_metadata['parents'] = [parent_id]
-
-    folder = drive_service.files().create(body=file_metadata, fields='id').execute()
+    folder = service.files().create(body=folder_metadata, fields='id').execute()
     return folder.get('id')
 
-PHOTO_EXTS = {'png', 'jpg', 'jpeg', 'webp'}
-VIDEO_EXTS = {'mp4', 'mov', 'mkv', 'webm'}
-AUDIO_EXTS = {'mp3', 'wav', 'aac', 'm4a'}
-
-def get_media_type(filename):
-    ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
-    if ext in PHOTO_EXTS: return 'photo'
-    elif ext in VIDEO_EXTS: return 'video'
-    elif ext in AUDIO_EXTS: return 'audio'
-    return None
-
-# --- AUTH & OAUTH2 ROUTES ---
-
+# -------------------------------------------------------------
+# Public & Authentication Routes
+# -------------------------------------------------------------
 @app.route('/')
-def home():
+def index():
     return render_template('index.html')
-
-@app.route('/connect-google')
-def connect_google():
-    client_id = session.get('client_id')
-    if not client_id:
-        return redirect(url_for('client_login'))
-
-    client_config = {
-        "web": {
-            "client_id": GOOGLE_CLIENT_ID,
-            "client_secret": GOOGLE_CLIENT_SECRET,
-            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-            "token_uri": "https://oauth2.googleapis.com/token"
-        }
-    }
-    flow = google_auth_oauthlib.flow.Flow.from_client_config(client_config, scopes=SCOPES)
-    flow.redirect_uri = url_for('oauth2callback', _external=True)
-    authorization_url, state = flow.authorization_url(access_type='offline', include_granted_scopes='true', prompt='consent')
-    session['state'] = state
-    return redirect(authorization_url)
-
-@app.route('/oauth2callback')
-def oauth2callback():
-    client_id = session.get('client_id')
-    if not client_id:
-        return redirect(url_for('client_login'))
-
-    state = session.get('state')
-    client_config = {
-        "web": {
-            "client_id": GOOGLE_CLIENT_ID,
-            "client_secret": GOOGLE_CLIENT_SECRET,
-            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-            "token_uri": "https://oauth2.googleapis.com/token"
-        }
-    }
-    flow = google_auth_oauthlib.flow.Flow.from_client_config(client_config, scopes=SCOPES, state=state)
-    flow.redirect_uri = url_for('oauth2callback', _external=True)
-    flow.fetch_token(authorization_response=request.url)
-    credentials = flow.credentials
-
-    creds_json = credentials.to_json()
-    with get_db() as conn:
-        conn.execute("UPDATE clients SET google_credentials = ? WHERE id = ?", (creds_json, client_id))
-        conn.commit()
-
-    return redirect(url_for('client_dashboard'))
-
-@app.route('/api/auth/send-otp', methods=['POST'])
-def send_otp():
-    target = request.json.get('target', '').strip().lower()
-    if not target or '@' not in target:
-        return jsonify({"success": False, "message": "Valid email address is required."}), 400
-
-    generated_otp = str(random.randint(100000, 999999))
-    OTP_STORE[target] = {"otp": generated_otp, "verified": False}
-
-    success, msg = send_email_otp(target, generated_otp)
-    if success:
-        return jsonify({"success": True, "message": "OTP sent successfully!"})
-    return jsonify({"success": False, "message": msg}), 500
-
-@app.route('/api/auth/verify-otp', methods=['POST'])
-def verify_otp():
-    target = request.json.get('target', '').strip().lower()
-    otp = request.json.get('otp', '').strip()
-
-    if target in OTP_STORE and OTP_STORE[target]['otp'] == otp:
-        OTP_STORE[target]['verified'] = True
-        return jsonify({"success": True, "message": "Email verified successfully!"})
-    return jsonify({"success": False, "message": "Invalid OTP code."}), 400
 
 @app.route('/client/signup', methods=['GET', 'POST'])
 def client_signup():
-    if request.method == 'POST':
-        studio_name = request.form.get('studio_name', '').strip()
-        email = request.form.get('email', '').strip().lower()
-        phone = request.form.get('phone', '').strip()
-        shop_address = request.form.get('shop_address', '').strip()
-        password = request.form.get('password', '')
-        confirm_password = request.form.get('confirm_password', '')
+    if request.method == 'GET':
+        return render_template('client_signup.html')
+    
+    data = request.form
+    studio_name = data.get('studio_name', '').strip()
+    owner_name = data.get('owner_name', '').strip()
+    email = data.get('email', '').strip().lower()
+    phone = data.get('phone', '').strip()
+    password = data.get('password', '')
+    otp = data.get('otp', '').strip()
 
-        if password != confirm_password:
-            return render_template('client_signup.html', error="Passwords do not match!")
+    # Verify OTP
+    if email not in OTP_STORE or OTP_STORE[email]['otp'] != otp:
+        return render_template('client_signup.html', error="Invalid or expired OTP. Please verify your email again.")
 
-        with get_db() as conn:
-            existing = conn.execute('SELECT id FROM clients WHERE email = ?', (email,)).fetchone()
-            if existing:
-                return render_template('client_signup.html', error="Email is already registered.")
+    hashed_pw = generate_password_hash(password)
 
-            client_id = str(uuid.uuid4())[:8]
-            p_hash = generate_password_hash(password)
-            conn.execute(
-                'INSERT INTO clients (id, studio_name, email, phone, shop_address, password_hash) VALUES (?, ?, ?, ?, ?, ?)',
-                (client_id, studio_name, email, phone, shop_address, p_hash)
-            )
-            conn.commit()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO clients (studio_name, owner_name, email, phone, password)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (studio_name, owner_name, email, phone, hashed_pw))
+        conn.commit()
+        client_id = cursor.lastrowid
+        conn.close()
 
         session['client_id'] = client_id
         session['studio_name'] = studio_name
+        OTP_STORE.pop(email, None)
         return redirect(url_for('client_dashboard'))
-
-    return render_template('client_signup.html')
+    except sqlite3.IntegrityError:
+        return render_template('client_signup.html', error="An account with this email already exists.")
 
 @app.route('/client/login', methods=['GET', 'POST'])
 def client_login():
-    if request.method == 'POST':
-        email = request.form.get('email', '').strip().lower()
-        password = request.form.get('password', '')
+    if request.method == 'GET':
+        return render_template('client_login.html')
 
-        with get_db() as conn:
-            client = conn.execute('SELECT * FROM clients WHERE email = ?', (email,)).fetchone()
-            if client and check_password_hash(client['password_hash'], password):
-                session['client_id'] = client['id']
-                session['studio_name'] = client['studio_name']
-                return redirect(url_for('client_dashboard'))
+    email = request.form.get('email', '').strip().lower()
+    password = request.form.get('password', '')
 
-        return render_template('client_login.html', error="Invalid email or password.")
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, studio_name, password FROM clients WHERE email = ?", (email,))
+    user = cursor.fetchone()
+    conn.close()
 
-    return render_template('client_login.html')
-
-@app.route('/client/forgot-password', methods=['GET'])
-def forgot_password():
-    return render_template('client_forgot_password.html')
-
-@app.route('/api/auth/reset-password', methods=['POST'])
-def reset_password():
-    email = request.json.get('email', '').strip().lower()
-    otp = request.json.get('otp', '').strip()
-    new_password = request.json.get('new_password', '')
-
-    if email not in OTP_STORE or OTP_STORE[email]['otp'] != otp:
-        return jsonify({"success": False, "message": "Invalid or unverified OTP."}), 400
-
-    with get_db() as conn:
-        client = conn.execute('SELECT id FROM clients WHERE email = ?', (email,)).fetchone()
-        if not client:
-            return jsonify({"success": False, "message": "Email not registered."}), 404
-
-        p_hash = generate_password_hash(new_password)
-        conn.execute('UPDATE clients SET password_hash = ? WHERE email = ?', (p_hash, email))
-        conn.commit()
-
-    OTP_STORE.pop(email, None)
-    return jsonify({"success": True, "message": "Password successfully reset!"})
+    if user and check_password_hash(user[2], password):
+        session['client_id'] = user[0]
+        session['studio_name'] = user[1]
+        return redirect(url_for('client_dashboard'))
+    
+    return render_template('client_login.html', error="Invalid email or password.")
 
 @app.route('/client/logout')
 def client_logout():
     session.clear()
     return redirect(url_for('client_login'))
 
-# --- DASHBOARD & DIRECT GOOGLE DRIVE UPLOAD ---
+@app.route('/client/forgot-password', methods=['GET', 'POST'])
+def client_forgot_password():
+    if request.method == 'GET':
+        return render_template('client_forgot_password.html')
+    
+    email = request.form.get('email', '').strip().lower()
+    otp = request.form.get('otp', '').strip()
+    new_password = request.form.get('new_password', '')
 
+    if email not in OTP_STORE or OTP_STORE[email]['otp'] != otp:
+        return render_template('client_forgot_password.html', error="Invalid or expired OTP.")
+
+    hashed_pw = generate_password_hash(new_password)
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE clients SET password = ? WHERE email = ?", (hashed_pw, email))
+    conn.commit()
+    conn.close()
+
+    OTP_STORE.pop(email, None)
+    return redirect(url_for('client_login'))
+
+# -------------------------------------------------------------
+# REST API for OTP Verification
+# -------------------------------------------------------------
+@app.route('/api/auth/send-otp', methods=['POST'])
+def api_send_otp():
+    target = request.json.get('target', '').strip().lower()
+    if not target or '@' not in target:
+        return jsonify({"success": False, "message": "Valid email address is required."}), 400
+
+    generated_otp = str(random.randint(100000, 999999))
+    OTP_STORE[target] = {"otp": generated_otp, "time": datetime.datetime.now()}
+
+    success, msg = send_email_otp(target, generated_otp)
+    if success:
+        return jsonify({"success": True, "message": "OTP has been sent to your email inbox."})
+    return jsonify({"success": False, "message": msg}), 500
+
+@app.route('/api/auth/verify-otp', methods=['POST'])
+def api_verify_otp():
+    data = request.get_json() or {}
+    target = data.get('target', '').strip().lower()
+    otp = data.get('otp', '').strip()
+
+    if target in OTP_STORE and OTP_STORE[target]['otp'] == otp:
+        return jsonify({"success": True, "message": "Email verified successfully."})
+    return jsonify({"success": False, "message": "Invalid or expired OTP."}), 400
+
+# -------------------------------------------------------------
+# Studio Client Dashboard & Events
+# -------------------------------------------------------------
 @app.route('/client/dashboard')
 def client_dashboard():
-    client_id = session.get('client_id')
-    if not client_id:
+    if 'client_id' not in session:
         return redirect(url_for('client_login'))
 
-    with get_db() as conn:
-        client = conn.execute('SELECT * FROM clients WHERE id = ?', (client_id,)).fetchone()
-        is_drive_connected = bool(client['google_credentials'])
+    client_id = session['client_id']
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
 
-        events = conn.execute('SELECT * FROM events WHERE client_id = ? ORDER BY created_at DESC', (client_id,)).fetchall()
-        event_data = []
-        for ev in events:
-            media = conn.execute('SELECT id, filename, media_type, drive_file_id FROM media_items WHERE event_id = ?', (ev['id'],)).fetchall()
-            guests = conn.execute('SELECT * FROM guest_logs WHERE event_id = ? ORDER BY created_at DESC', (ev['id'],)).fetchall()
-            
-            event_data.append({
-                "id": ev['id'],
-                "name": ev['name'],
-                "photos": [m for m in media if m['media_type'] == 'photo'],
-                "videos": [m for m in media if m['media_type'] == 'video'],
-                "audios": [m for m in media if m['media_type'] == 'audio'],
-                "guests": guests
-            })
+    cursor.execute("SELECT google_tokens, studio_name FROM clients WHERE id = ?", (client_id,))
+    client_row = cursor.fetchone()
+    has_drive = bool(client_row and client_row[0])
 
-    return render_template('client_dashboard.html', 
-                           studio_name=session.get('studio_name'), 
-                           events=event_data, 
-                           is_drive_connected=is_drive_connected)
+    cursor.execute("SELECT id, event_id, event_name, event_date, created_at FROM events WHERE client_id = ? ORDER BY id DESC", (client_id,))
+    events = cursor.fetchall()
+    conn.close()
 
-@app.route('/api/create-event', methods=['POST'])
+    return render_template('client_dashboard.html', studio_name=session.get('studio_name'), has_drive=has_drive, events=events)
+
+@app.route('/client/events/create', methods=['POST'])
 def create_event():
-    client_id = session.get('client_id')
-    if not client_id:
-        return jsonify({"error": "Unauthorized"}), 401
+    if 'client_id' not in session:
+        return redirect(url_for('client_login'))
 
-    drive_service = get_client_drive_service(client_id)
-    if not drive_service:
-        return jsonify({"error": "Pehle apna Google Drive connect karein!"}), 400
+    client_id = session['client_id']
+    event_name = request.form.get('event_name', '').strip()
+    event_date = request.form.get('event_date', '').strip()
+    event_id = "EVT-" + str(random.randint(100000, 999999))
 
-    event_name = request.form.get('event_name')
-    files = request.files.getlist('media_files')
+    drive_service = get_drive_service(client_id)
+    folder_id = None
 
-    if not event_name or not files:
-        return jsonify({"error": "Event title aur media files zaroori hain."}), 400
+    if drive_service:
+        try:
+            root_id = get_or_create_root_folder(drive_service)
+            folder_metadata = {
+                'name': f"{event_name} ({event_id})",
+                'mimeType': 'application/vnd.google-apps.folder',
+                'parents': [root_id]
+            }
+            folder = drive_service.files().create(body=folder_metadata, fields='id').execute()
+            folder_id = folder.get('id')
+        except Exception as e:
+            print(f"[Drive Folder Error]: {e}")
 
-    event_id = str(uuid.uuid4())[:6].upper()
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO events (client_id, event_id, event_name, event_date, drive_folder_id)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (client_id, event_id, event_name, event_date, folder_id))
+    conn.commit()
+    conn.close()
 
-    main_folder_id = get_or_create_folder(drive_service, "StudioFace Events")
-    event_folder_id = get_or_create_folder(drive_service, f"{event_name} ({event_id})", parent_id=main_folder_id)
+    return redirect(url_for('client_dashboard'))
 
-    with get_db() as conn:
-        conn.execute('INSERT INTO events (id, client_id, name, drive_folder_id) VALUES (?, ?, ?, ?)',
-                     (event_id, client_id, event_name, event_folder_id))
+# -------------------------------------------------------------
+# Google OAuth Integration Routes
+# -------------------------------------------------------------
+@app.route('/auth/google/connect')
+def google_connect():
+    if 'client_id' not in session:
+        return redirect(url_for('client_login'))
 
-        for file in files:
-            if file and file.filename != '':
-                mtype = get_media_type(file.filename)
-                if mtype:
-                    filename = secure_filename(file.filename)
-                    file_stream = io.BytesIO(file.read())
-                    media_body = MediaIoBaseUpload(file_stream, mimetype=file.content_type or 'application/octet-stream', resumable=True)
-                    file_metadata = {
-                        'name': filename,
-                        'parents': [event_folder_id]
-                    }
-                    uploaded_file = drive_service.files().create(body=file_metadata, media_body=media_body, fields='id').execute()
-                    drive_file_id = uploaded_file.get('id')
+    # Host-aware redirect URL for production Render & localhost
+    redirect_uri = url_for('oauth2callback', _external=True)
+    
+    client_config = {
+        "web": {
+            "client_id": os.environ.get("GOOGLE_CLIENT_ID", ""),
+            "client_secret": os.environ.get("GOOGLE_CLIENT_SECRET", ""),
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token"
+        }
+    }
 
-                    conn.execute('INSERT INTO media_items (event_id, filename, media_type, drive_file_id) VALUES (?, ?, ?, ?)',
-                                 (event_id, filename, mtype, drive_file_id))
-        conn.commit()
+    flow = Flow.from_client_config(
+        client_config,
+        scopes=SCOPES,
+        redirect_uri=redirect_uri
+    )
+    authorization_url, state = flow.authorization_url(
+        access_type='offline',
+        include_granted_scopes='true',
+        prompt='consent'
+    )
+    session['oauth_state'] = state
+    return redirect(authorization_url)
 
-    return jsonify({"success": True, "event_id": event_id})
+@app.route('/oauth2callback')
+def oauth2callback():
+    if 'client_id' not in session:
+        return redirect(url_for('client_login'))
 
-@app.route('/api/event/<event_id>/add-media', methods=['POST'])
-def add_media(event_id):
-    client_id = session.get('client_id')
-    if not client_id:
-        return jsonify({"error": "Unauthorized"}), 401
+    redirect_uri = url_for('oauth2callback', _external=True)
+    client_config = {
+        "web": {
+            "client_id": os.environ.get("GOOGLE_CLIENT_ID", ""),
+            "client_secret": os.environ.get("GOOGLE_CLIENT_SECRET", ""),
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token"
+        }
+    }
 
-    drive_service = get_client_drive_service(client_id)
-    if not drive_service:
-        return jsonify({"error": "Google Drive not connected"}), 400
+    flow = Flow.from_client_config(
+        client_config,
+        scopes=SCOPES,
+        state=session.get('oauth_state'),
+        redirect_uri=redirect_uri
+    )
+    flow.fetch_token(authorization_response=request.url)
+    creds = flow.credentials
 
-    with get_db() as conn:
-        event = conn.execute("SELECT drive_folder_id FROM events WHERE id = ?", (event_id,)).fetchone()
-        event_folder_id = event['drive_folder_id'] if event else None
+    token_data = {
+        'token': creds.token,
+        'refresh_token': creds.refresh_token,
+        'client_id': creds.client_id,
+        'client_secret': creds.client_secret,
+        'scopes': creds.scopes
+    }
 
-    files = request.files.getlist('media_files')
-    with get_db() as conn:
-        for file in files:
-            mtype = get_media_type(file.filename)
-            if mtype:
-                filename = secure_filename(file.filename)
-                file_stream = io.BytesIO(file.read())
-                media_body = MediaIoBaseUpload(file_stream, mimetype=file.content_type or 'application/octet-stream', resumable=True)
-                file_metadata = {'name': filename, 'parents': [event_folder_id]}
-                uploaded = drive_service.files().create(body=file_metadata, media_body=media_body, fields='id').execute()
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE clients SET google_tokens = ? WHERE id = ?", (json.dumps(token_data), session['client_id']))
+    conn.commit()
+    conn.close()
 
-                conn.execute('INSERT INTO media_items (event_id, filename, media_type, drive_file_id) VALUES (?, ?, ?, ?)',
-                             (event_id, filename, mtype, uploaded.get('id')))
-        conn.commit()
+    return redirect(url_for('client_dashboard'))
 
-    return jsonify({"success": True})
-
-@app.route('/api/media/<int:media_id>/delete', methods=['POST'])
-def delete_media(media_id):
-    client_id = session.get('client_id')
-    if not client_id:
-        return jsonify({"error": "Unauthorized"}), 401
-
-    drive_service = get_client_drive_service(client_id)
-    with get_db() as conn:
-        item = conn.execute('SELECT drive_file_id FROM media_items WHERE id = ?', (media_id,)).fetchone()
-        if item and item['drive_file_id'] and drive_service:
-            try:
-                drive_service.files().delete(fileId=item['drive_file_id']).execute()
-            except Exception:
-                pass
-        conn.execute('DELETE FROM media_items WHERE id = ?', (media_id,))
-        conn.commit()
-
-    return jsonify({"success": True})
-
-@app.route('/api/event/<event_id>/delete', methods=['POST'])
-def delete_event(event_id):
-    client_id = session.get('client_id')
-    if not client_id:
-        return jsonify({"error": "Unauthorized"}), 401
-
-    drive_service = get_client_drive_service(client_id)
-    with get_db() as conn:
-        event = conn.execute('SELECT drive_folder_id FROM events WHERE id = ?', (event_id,)).fetchone()
-        if event and event['drive_folder_id'] and drive_service:
-            try:
-                drive_service.files().delete(fileId=event['drive_folder_id']).execute()
-            except Exception:
-                pass
-        conn.execute('DELETE FROM media_items WHERE event_id = ?', (event_id,))
-        conn.execute('DELETE FROM guest_logs WHERE event_id = ?', (event_id,))
-        conn.execute('DELETE FROM events WHERE id = ?', (event_id,))
-        conn.commit()
-
-    return jsonify({"success": True})
-
-# --- GUEST SCAN & DRIVE STREAMING ---
-
-@app.route('/event/<event_id>')
+# -------------------------------------------------------------
+# Guest Portal & Face Matching
+# -------------------------------------------------------------
+@app.route('/guest/<event_id>')
 def guest_portal(event_id):
-    event_id = event_id.upper()
-    with get_db() as conn:
-        event = conn.execute('SELECT * FROM events WHERE id = ?', (event_id,)).fetchone()
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT event_name, event_date FROM events WHERE event_id = ?", (event_id,))
+    event = cursor.fetchone()
+    conn.close()
+
     if not event:
-        return render_template('index.html', error="Invalid Event Code! Please check again.")
-    return render_template('guest_portal.html', event_id=event_id, event_name=event['name'])
+        return "Event not found", 404
 
-@app.route('/api/event/<event_id>/scan', methods=['POST'])
-def scan_guest(event_id):
-    event_id = event_id.upper()
-    name = request.form.get('name', '').strip()
-    phone = request.form.get('phone', '').strip()
-    selfie = request.files.get('selfie')
+    return render_template('guest_portal.html', event_id=event_id, event_name=event[0], event_date=event[1])
 
-    if not name or not phone or not selfie:
-        return jsonify({"success": False, "message": "All fields and selfie are required."}), 400
-
-    in_memory = io.BytesIO()
-    selfie.save(in_memory)
-    data = np.frombuffer(in_memory.getvalue(), dtype=np.uint8)
-    user_img = cv2.imdecode(data, cv2.IMREAD_COLOR)
-
-    if user_img is None:
-        return jsonify({"success": False, "message": "Invalid selfie image format."}), 400
-
-    gray = cv2.cvtColor(user_img, cv2.COLOR_BGR2GRAY)
-    faces = face_cascade.detectMultiScale(gray, 1.1, 4)
-
-    if len(faces) == 0:
-        return jsonify({"success": False, "message": "Face not recognized in selfie. Take clear photo."}), 422
-
-    matched_photos = []
-    videos = []
-    audios = []
-
-    with get_db() as conn:
-        ev = conn.execute('SELECT client_id FROM events WHERE id = ?', (event_id,)).fetchone()
-        if not ev:
-            return jsonify({"success": False, "message": "Event not found"}), 404
-        
-        drive_service = get_client_drive_service(ev['client_id'])
-        all_media = conn.execute('SELECT id, filename, media_type, drive_file_id FROM media_items WHERE event_id = ?', (event_id,)).fetchall()
-
-        for item in all_media:
-            fid = item['drive_file_id']
-            fname = item['filename']
-            mtype = item['media_type']
-
-            if mtype == 'photo' and drive_service and fid:
-                try:
-                    req_file = drive_service.files().get_media(fileId=fid)
-                    fh = io.BytesIO()
-                    downloader = MediaIoBaseDownload(fh, req_file)
-                    done = False
-                    while not done:
-                        status, done = downloader.next_chunk()
-                    
-                    fh.seek(0)
-                    img_data = np.frombuffer(fh.read(), dtype=np.uint8)
-                    img = cv2.imdecode(img_data, cv2.IMREAD_COLOR)
-                    if img is not None:
-                        g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                        f = face_cascade.detectMultiScale(g, 1.1, 4)
-                        if len(f) > 0:
-                            matched_photos.append({"id": fid, "name": fname})
-                except Exception:
-                    pass
-            elif mtype == 'video':
-                videos.append({"id": fid, "name": fname})
-            elif mtype == 'audio':
-                audios.append({"id": fid, "name": fname})
-
-        conn.execute('INSERT INTO guest_logs (event_id, name, phone, matched_count) VALUES (?, ?, ?, ?)',
-                     (event_id, name, phone, len(matched_photos)))
-        conn.commit()
-
-    return jsonify({
-        "success": True,
-        "name": name,
-        "photos": matched_photos,
-        "videos": videos,
-        "audios": audios
-    })
-
-@app.route('/drive/file/<file_id>')
-def serve_drive_file(file_id):
-    with get_db() as conn:
-        item = conn.execute('SELECT event_id, filename FROM media_items WHERE drive_file_id = ?', (file_id,)).fetchone()
-        if not item:
-            return "File not found", 404
-        ev = conn.execute('SELECT client_id FROM events WHERE id = ?', (item['event_id'],)).fetchone()
-        drive_service = get_client_drive_service(ev['client_id'])
-
-    if not drive_service:
-        return "Drive access error", 500
-
-    req_file = drive_service.files().get_media(fileId=file_id)
-    fh = io.BytesIO()
-    downloader = MediaIoBaseDownload(fh, req_file)
-    done = False
-    while not done:
-        status, done = downloader.next_chunk()
-    fh.seek(0)
-    return send_file(fh, download_name=item['filename'], as_attachment=False)
-
+# -------------------------------------------------------------
+# Entry Point
+# -------------------------------------------------------------
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=True)
+    app.run(host='0.0.0.0', port=port, debug=False)
