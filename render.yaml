@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: studioface
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn --workers 2 --threads 4 --timeout 180 --bind 0.0.0.0:$PORT app:app
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: SESSION_COOKIE_SECURE
+        value: "1"
+      - key: MAX_CONTENT_LENGTH
+        value: "262144000"

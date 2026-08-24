@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#090b16">
+  <meta name="description" content="StudioFace AI — professional event media delivery workspace">
+  <meta name="csrf-token" content="{{ csrf_token }}">
+  <title>{% block title %}StudioFace AI{% endblock %}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+</head>
+<body>
+  <div class="bg-orb orb-a"></div><div class="bg-orb orb-b"></div>
+  <header class="topbar">
+    <a class="brand" href="{{ url_for('index') }}"><span class="brand-mark">S</span><span>StudioFace<span class="brand-muted"> AI</span></span></a>
+    <nav>
+      {% if session.get('client_id') %}
+        <a href="{{ url_for('client_dashboard') }}">Dashboard</a>
+        <a class="nav-ghost" href="{{ url_for('client_logout') }}">Logout</a>
+      {% else %}
+        <a href="{{ url_for('client_login') }}">Login</a>
+        <a class="nav-primary" href="{{ url_for('client_signup') }}">Get started</a>
+      {% endif %}
+    </nav>
+  </header>
+  <main class="page-shell">
+    {% if error %}<div class="alert danger">{{ error }}</div>{% endif %}
+    {% if message %}<div class="alert success">{{ message }}</div>{% endif %}
+    {% block content %}{% endblock %}
+  </main>
+  <footer class="footer">StudioFace AI · Built for modern photo & video studios · <a href="{{ url_for('privacy') }}">Privacy</a> · <a href="{{ url_for('terms') }}">Terms</a></footer>
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

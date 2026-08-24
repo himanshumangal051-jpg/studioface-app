@@ -1,56 +1,25 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>StudioFace | Multi-Media AI Cloud</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <link rel="stylesheet" href="/static/css/style.css">
-    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
-</head>
-<body class="min-h-screen flex flex-col justify-between text-slate-200">
-
-    <header class="max-w-7xl mx-auto w-full px-6 py-6 flex justify-between items-center">
-        <div class="flex items-center gap-3">
-            <div class="h-10 w-10 bg-indigo-600 rounded-xl flex items-center justify-center text-white font-black text-xl shadow-lg shadow-indigo-600/30">AI</div>
-            <span class="text-xl font-bold tracking-tight text-white">StudioFace Hub</span>
-        </div>
-        <div class="flex items-center gap-3">
-            <a href="/client/login" class="text-sm font-semibold bg-slate-800 hover:bg-slate-700 px-4 py-2.5 rounded-xl border border-slate-700 transition">
-                Sign In
-            </a>
-            <a href="/client/signup" class="text-sm font-semibold btn-glow text-white px-5 py-2.5 rounded-xl transition">
-                Create Studio
-            </a>
-        </div>
-    </header>
-
-    <main class="max-w-4xl mx-auto px-6 py-12 text-center">
-        <span class="text-xs bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 px-4 py-1.5 rounded-full font-bold uppercase tracking-wider">AI Face Finder & Media Portal</span>
-        <h1 class="text-4xl md:text-6xl font-extrabold text-white mt-6 mb-4 tracking-tight leading-tight">
-            Smart Photo & Media Distribution <br><span class="text-transparent bg-clip-text bg-gradient-to-r from-indigo-400 to-purple-400">For Modern Studios</span>
-        </h1>
-        <p class="text-slate-400 text-sm md:text-base max-w-xl mx-auto mb-10">
-            Enter your event access code below to filter your face-matched photos, stream wedding videos, and download original audio tracks.
-        </p>
-
-        <div class="glass-card p-6 md:p-8 rounded-3xl max-w-md mx-auto">
-            <h3 class="text-lg font-bold text-white mb-2">Guest Event Access</h3>
-            {% if error %}<p class="text-xs bg-red-500/20 text-red-400 p-2.5 rounded-xl mb-4">{{ error }}</p>{% endif %}
-            <form onsubmit="event.preventDefault(); window.location.href='/event/' + document.getElementById('eventCode').value.trim();" class="space-y-4">
-                <div>
-                    <input type="text" id="eventCode" placeholder="Enter Event Code (e.g. A8F2E1)" class="w-full bg-slate-900 border border-slate-700 rounded-xl p-3.5 text-center font-mono uppercase tracking-widest text-indigo-300 text-lg outline-none focus:border-indigo-500 transition" required>
-                </div>
-                <button type="submit" class="w-full btn-glow text-white font-bold py-3.5 rounded-xl flex items-center justify-center gap-2">
-                    <span>Unlock Media Portal</span>
-                    <i class="fa-solid fa-arrow-right text-xs"></i>
-                </button>
-            </form>
-        </div>
-    </main>
-
-    <footer class="text-center py-6 text-xs text-slate-500 border-t border-slate-800">
-        StudioFace Engine © 2026. Built with Python AI & Flask.
-    </footer>
-</body>
-</html>
+{% extends 'base.html' %}
+{% block title %}StudioFace AI — Your studio, beautifully connected{% endblock %}
+{% block content %}
+<section class="hero">
+  <div class="hero-copy">
+    <div class="eyebrow">PROFESSIONAL STUDIO WORKSPACE</div>
+    <h1>Make every event<br><span>feel premium.</span></h1>
+    <p class="hero-text">StudioFace brings studio accounts, event uploads and Google Drive delivery into one polished workspace.</p>
+    <div class="hero-actions"><a class="btn primary" href="{{ url_for('client_signup') }}">Create studio account</a><a class="btn secondary" href="{{ url_for('client_login') }}">Sign in</a></div>
+    <div class="trust-row"><span>✓ Secure accounts</span><span>✓ Google Drive sync</span><span>✓ Event-based delivery</span></div>
+  </div>
+  <div class="hero-card glass">
+    <div class="card-top"><span>STUDIO OVERVIEW</span><span class="status-pill live">LIVE</span></div>
+    <div class="hero-stat"><strong>24</strong><span>active events</span></div>
+    <div class="mini-grid"><div><b>1,248</b><span>media files</span></div><div><b>99.9%</b><span>sync reliability</span></div></div>
+    <div class="activity"><div class="activity-dot"></div><div><b>Google Drive</b><span>Connected and ready</span></div><span class="activity-check">✓</span></div>
+    <div class="activity"><div class="activity-dot violet"></div><div><b>Wedding — Aarav & Kiara</b><span>68 files uploaded</span></div><span class="activity-time">2m</span></div>
+  </div>
+</section>
+<section class="feature-grid">
+  <article class="feature glass"><span class="icon">01</span><h3>Client-ready dashboard</h3><p>Keep your studio identity, events and upload workflow together.</p></article>
+  <article class="feature glass"><span class="icon">02</span><h3>Google Drive delivery</h3><p>Connect a client Drive and automatically organize each event into a folder.</p></article>
+  <article class="feature glass"><span class="icon">03</span><h3>Safer by design</h3><p>OTP protection, session security, rate limits and upload validation built in.</p></article>
+</section>
+{% endblock %}
