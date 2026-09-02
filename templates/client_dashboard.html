@@ -1,16 +1,282 @@
-{% extends 'base.html' %}
-{% block title %}Dashboard — {{ studio_name or 'StudioFace' }}{% endblock %}
-{% block content %}
-<section class="dashboard-head"><div><div class="eyebrow">STUDIO WORKSPACE</div><h1>{{ studio_name or 'Your Studio' }}</h1><p class="muted">Manage event delivery without the clutter.</p></div><a class="btn secondary" href="{{ url_for('client_logout') }}">Sign out</a></section>
-<section class="dashboard-grid">
-<div class="panel glass drive-panel"><div class="panel-head"><div><span class="eyebrow">CLOUD DELIVERY</span><h2>Google Drive</h2></div><span class="status-pill {{ 'live' if has_drive else 'pending' }}">{{ 'CONNECTED' if has_drive else 'PENDING' }}</span></div>
-{% if has_drive %}<p class="muted">Your Drive is connected. New event media can be uploaded into organized folders.</p><div class="connected-box"><span class="check">✓</span><div><b>Ready to upload</b><small>Drive folder: StudioFace Events</small></div></div>{% else %}<p class="muted">Connect Google Drive before creating your first event upload.</p><a class="btn primary" href="{{ url_for('google_connect') }}">Connect Google Drive</a>{% endif %}
-</div>
-<div class="panel glass"><div class="panel-head"><div><span class="eyebrow">NEW EVENT</span><h2>Upload media</h2></div></div>
-<form id="eventForm" class="form-grid" enctype="multipart/form-data"><label>Event title<input name="event_name" id="eventName" required maxlength="200" placeholder="Wedding — Aarav & Kiara"></label><label>Photos / videos<input name="media_files" id="mediaFiles" type="file" multiple accept="image/*,video/*,audio/*" required></label><div id="fileSummary" class="helper"></div><button class="btn primary wide" type="submit" {% if not has_drive %}disabled{% endif %}>Upload & create event</button></form><div id="uploadMessage" class="helper"></div>
-</div>
-</section>
-<section class="panel glass events-panel"><div class="panel-head"><div><span class="eyebrow">EVENT LIBRARY</span><h2>Your active events</h2></div><span class="count-badge">{{ events|length }}</span></div>
-{% if events %}<div class="event-list">{% for e in events %}<article class="event-item"><div class="event-icon">✦</div><div class="event-main"><h3>{{ e[2] }}</h3><p>{{ e[3] }} · Event ID {{ e[1] }}</p></div><div class="event-state">SYNCED</div></article>{% endfor %}</div>{% else %}<div class="empty-state"><div class="empty-icon">✦</div><h3>No events yet</h3><p>Create your first event and send the media straight to Google Drive.</p></div>{% endif %}
-</section>
-{% endblock %}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Studio Workspace - StudioFace AI</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <meta name="csrf-token" content="{{ csrf_token }}">
+</head>
+<body class="bg-[#0b0f19] text-slate-100 min-h-screen">
+
+  <!-- Header -->
+  <header class="border-b border-slate-800 bg-[#0F172A]/80 backdrop-blur sticky top-0 z-40">
+    <div class="max-w-7xl mx-auto px-4 h-16 flex items-center justify-between">
+      <div class="flex items-center gap-3">
+        <div class="w-9 h-9 rounded-xl bg-indigo-600 flex items-center justify-center font-bold text-white shadow-lg shadow-indigo-500/30">S</div>
+        <span class="font-bold text-lg tracking-tight">StudioFace <span class="text-indigo-400">AI</span></span>
+      </div>
+      <div class="flex items-center gap-4">
+        <span class="text-sm font-medium text-slate-400 hidden sm:inline">{{ studio_name }}</span>
+        <a href="/client/logout" class="px-4 py-2 text-xs font-semibold rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition">Logout</a>
+      </div>
+    </div>
+  </header>
+
+  <main class="max-w-7xl mx-auto px-4 py-8 space-y-8">
+    
+    <!-- Top Workspace Greeting -->
+    <div>
+      <p class="text-xs uppercase tracking-widest text-indigo-400 font-bold">Studio Workspace</p>
+      <h1 class="text-3xl font-extrabold text-white mt-1">{{ studio_name }}</h1>
+      <p class="text-slate-400 text-sm mt-1">Manage event media delivery, public access PINs, and guest face matching.</p>
+    </div>
+
+    <!-- Top Action Cards -->
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+
+      <!-- Drive Status Card -->
+      <div class="bg-[#131b2e] border border-slate-800/80 rounded-2xl p-6 relative flex flex-col justify-between">
+        <div>
+          <div class="flex items-center justify-between">
+            <h2 class="text-xs uppercase tracking-wider text-slate-400 font-semibold">Cloud Delivery</h2>
+            {% if has_drive %}
+              <span class="px-2.5 py-1 rounded-full text-[11px] font-bold bg-emerald-950 text-emerald-400 border border-emerald-800">CONNECTED</span>
+            {% else %}
+              <span class="px-2.5 py-1 rounded-full text-[11px] font-bold bg-amber-950 text-amber-400 border border-amber-800">ACTION REQUIRED</span>
+            {% endif %}
+          </div>
+          <h3 class="text-xl font-bold text-white mt-2">Google Drive</h3>
+          <p class="text-slate-400 text-sm mt-1">
+            {% if has_drive %}
+              Your Google Drive is fully synced. Event folders are automatically structured under <code>StudioFace Events</code>.
+            {% else %}
+              Authorize Google Drive to allow automated storage and high-speed delivery to clients.
+            {% endif %}
+          </p>
+        </div>
+
+        <div class="mt-6">
+          {% if has_drive %}
+            <div class="flex items-center gap-3 p-3 bg-slate-900/60 rounded-xl border border-slate-800 text-emerald-400 text-xs font-medium">
+              <span>✔ Ready to upload & sync</span>
+            </div>
+          {% else %}
+            <a href="/connect-google" class="inline-flex items-center justify-center w-full py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold rounded-xl shadow-lg transition">Connect Google Drive</a>
+          {% endif %}
+        </div>
+      </div>
+
+      <!-- New Event Upload Card -->
+      <div class="bg-[#131b2e] border border-slate-800/80 rounded-2xl p-6">
+        <h2 class="text-xs uppercase tracking-wider text-indigo-400 font-semibold">New Event</h2>
+        <h3 class="text-xl font-bold text-white mt-1">Create Event & Upload Media</h3>
+
+        <form id="createEventForm" class="mt-4 space-y-4" enctype="multipart/form-data">
+          <div>
+            <label class="block text-xs font-medium text-slate-300">Event Title *</label>
+            <input type="text" name="event_name" placeholder="e.g. Rahul & Sneha Wedding" required class="w-full mt-1.5 bg-[#0b0f19] border border-slate-700 rounded-xl px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500">
+          </div>
+
+          <div>
+            <label class="block text-xs font-medium text-slate-300">Photos / Videos *</label>
+            <input type="file" name="media_files" multiple accept="image/*,video/*" required class="w-full mt-1.5 text-xs text-slate-400 file:mr-3 file:py-2 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-semibold file:bg-slate-800 file:text-indigo-300 hover:file:bg-slate-700 cursor-pointer">
+          </div>
+
+          <button type="submit" id="uploadBtn" class="w-full py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold rounded-xl transition flex items-center justify-center gap-2">
+            Upload & Create Event
+          </button>
+        </form>
+      </div>
+
+    </div>
+
+    <!-- Active Events Section -->
+    <div class="bg-[#131b2e] border border-slate-800/80 rounded-2xl p-6">
+      <div class="flex items-center justify-between border-b border-slate-800 pb-4">
+        <div>
+          <h2 class="text-xs uppercase tracking-wider text-slate-400 font-semibold">Event Library</h2>
+          <h3 class="text-xl font-bold text-white mt-1">Your Active Events</h3>
+        </div>
+        <span class="text-xs font-bold bg-slate-800 px-3 py-1 rounded-full text-indigo-400 border border-slate-700">{{ events|length }} Total</span>
+      </div>
+
+      <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5 mt-6">
+        {% for ev in events %}
+          <div class="bg-[#0b0f19] border border-slate-800 rounded-xl p-5 flex flex-col justify-between hover:border-slate-700 transition">
+            <div>
+              <div class="flex items-center justify-between">
+                <span class="text-[10px] uppercase font-bold tracking-widest text-slate-500">{{ ev[4] }}</span>
+                <span class="px-2 py-0.5 rounded text-[11px] font-mono bg-indigo-950/80 text-indigo-300 border border-indigo-800">PIN: {{ ev[3] }}</span>
+              </div>
+              <h4 class="text-lg font-bold text-white mt-2">{{ ev[2] }}</h4>
+            </div>
+
+            <div class="mt-6 space-y-2 pt-4 border-t border-slate-800/80">
+              <!-- Public Link for Guests -->
+              <div class="flex items-center gap-2">
+                <input type="text" readonly value="{{ request.host_url }}event/{{ ev[1] }}" class="w-full bg-slate-900 border border-slate-800 rounded-lg px-2.5 py-1 text-[11px] font-mono text-slate-400 select-all">
+                <button onclick="copyToClipboard('{{ request.host_url }}event/{{ ev[1] }}')" class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-xs rounded-lg font-semibold text-slate-300 border border-slate-700">Copy</button>
+              </div>
+
+              <!-- Manage / Delete / Add button -->
+              <div class="grid grid-cols-2 gap-2 pt-2">
+                <button onclick="openMediaManager('{{ ev[1] }}', '{{ ev[2] }}')" class="py-1.5 bg-indigo-950/60 hover:bg-indigo-900/80 text-indigo-300 border border-indigo-800 text-xs font-bold rounded-lg transition">Manage Files</button>
+                <a href="/event/{{ ev[1] }}" target="_blank" class="py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-xs font-bold rounded-lg text-center transition">Open Portal</a>
+              </div>
+            </div>
+          </div>
+        {% else %}
+          <div class="col-span-full py-12 text-center text-slate-500 text-sm">
+            No events found. Create your first event above to get a public link and PIN.
+          </div>
+        {% endfor %}
+      </div>
+    </div>
+
+  </main>
+
+  <!-- Media Management Modal -->
+  <div id="mediaModal" class="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
+    <div class="bg-[#131b2e] border border-slate-800 max-w-2xl w-full rounded-2xl p-6 shadow-2xl flex flex-col max-h-[90vh]">
+      <div class="flex items-center justify-between border-b border-slate-800 pb-4">
+        <div>
+          <h3 id="modalEventTitle" class="text-lg font-bold text-white">Event Media Manager</h3>
+          <p class="text-xs text-slate-400">Add or remove photos and videos from Google Drive</p>
+        </div>
+        <button onclick="closeMediaModal()" class="text-slate-400 hover:text-white font-bold text-xl">&times;</button>
+      </div>
+
+      <!-- Add Files Section -->
+      <form id="addMediaForm" class="py-4 border-b border-slate-800 flex items-center gap-3" enctype="multipart/form-data">
+        <input type="hidden" id="modalEventId">
+        <input type="file" id="additionalFiles" name="media_files" multiple accept="image/*,video/*" required class="w-full text-xs text-slate-400 file:mr-2 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:bg-slate-800 file:text-indigo-300 cursor-pointer">
+        <button type="submit" id="addBtn" class="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-xs font-bold rounded-lg text-white whitespace-nowrap">Add Photos</button>
+      </form>
+
+      <!-- Media List -->
+      <div id="mediaListContainer" class="overflow-y-auto space-y-2 py-4 flex-1">
+        <p class="text-center text-slate-500 text-xs">Loading items...</p>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const csrfToken = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
+
+    function copyToClipboard(text) {
+      navigator.clipboard.writeText(text);
+      alert("Public Event Link Copied!");
+    }
+
+    // Create Event Form Handler
+    document.getElementById('createEventForm').onsubmit = async (e) => {
+      e.preventDefault();
+      const btn = document.getElementById('uploadBtn');
+      btn.disabled = true;
+      btn.innerText = "Processing & Extracting Faces...";
+
+      const formData = new FormData(e.target);
+      formData.append('csrf_token', csrfToken);
+
+      try {
+        const res = await fetch('/api/events/create', { method: 'POST', body: formData });
+        const data = await res.json();
+        if (data.success) {
+          alert(`Event created!\nShare Link: ${window.location.origin}${data.share_url}\nEvent PIN: ${data.event_pin}`);
+          window.location.reload();
+        } else {
+          alert(data.message || "Failed to create event");
+          btn.disabled = false;
+          btn.innerText = "Upload & Create Event";
+        }
+      } catch (err) {
+        alert("Upload error. Please try again.");
+        btn.disabled = false;
+        btn.innerText = "Upload & Create Event";
+      }
+    };
+
+    // Open Modal and Fetch Media
+    async function openMediaManager(eventId, title) {
+      document.getElementById('modalEventId').value = eventId;
+      document.getElementById('modalEventTitle').innerText = title;
+      document.getElementById('mediaModal').classList.remove('hidden');
+      await loadMedia(eventId);
+    }
+
+    function closeMediaModal() {
+      document.getElementById('mediaModal').classList.add('hidden');
+    }
+
+    async function loadMedia(eventId) {
+      const cont = document.getElementById('mediaListContainer');
+      cont.innerHTML = '<p class="text-center text-slate-500 text-xs">Loading media...</p>';
+      const res = await fetch(`/api/events/${eventId}/media`);
+      const data = await res.json();
+
+      if (!data.success || data.media.length === 0) {
+        cont.innerHTML = '<p class="text-center text-slate-500 text-xs">No media files in this event.</p>';
+        return;
+      }
+
+      cont.innerHTML = '';
+      data.media.forEach(m => {
+        const row = document.createElement('div');
+        row.className = "flex items-center justify-between p-2.5 bg-slate-900/70 border border-slate-800 rounded-xl";
+        row.innerHTML = `
+          <div class="flex items-center gap-3">
+            <span class="text-base">${m.is_video ? '🎬' : '📸'}</span>
+            <span class="text-xs font-mono text-slate-300 max-w-xs truncate">${m.file_name}</span>
+          </div>
+          <button onclick="deleteMedia('${eventId}', '${m.id}')" class="px-2.5 py-1 bg-rose-950/80 hover:bg-rose-900 border border-rose-800 text-rose-300 text-[11px] font-bold rounded-lg transition">Delete</button>
+        `;
+        cont.appendChild(row);
+      });
+    }
+
+    // Add Media Handler
+    document.getElementById('addMediaForm').onsubmit = async (e) => {
+      e.preventDefault();
+      const eventId = document.getElementById('modalEventId').value;
+      const btn = document.getElementById('addBtn');
+      btn.disabled = true;
+      btn.innerText = "Adding...";
+
+      const formData = new FormData();
+      const files = document.getElementById('additionalFiles').files;
+      for (let i = 0; i < files.length; i++) {
+        formData.append('media_files', files[i]);
+      }
+      formData.append('csrf_token', csrfToken);
+
+      const res = await fetch(`/api/events/${eventId}/media/add`, { method: 'POST', body: formData });
+      const data = await res.json();
+      btn.disabled = false;
+      btn.innerText = "Add Photos";
+
+      if (data.success) {
+        document.getElementById('additionalFiles').value = '';
+        await loadMedia(eventId);
+      } else {
+        alert(data.message);
+      }
+    };
+
+    // Delete Media Handler
+    async function deleteMedia(eventId, mediaId) {
+      if (!confirm("Are you sure you want to delete this file from Google Drive?")) return;
+      const res = await fetch(`/api/events/${eventId}/media/${mediaId}`, {
+        method: 'DELETE',
+        headers: { 'X-CSRF-Token': csrfToken }
+      });
+      const data = await res.json();
+      if (data.success) {
+        await loadMedia(eventId);
+      } else {
+        alert(data.message);
+      }
+    }
+  </script>
+</body>
+</html>
