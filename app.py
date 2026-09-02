@@ -40,7 +40,6 @@ DB_PATH = os.path.join(BASE_DIR, "face_engine.db")
 
 SECRET_KEY = os.environ.get("SECRET_KEY")
 if not SECRET_KEY:
-    # Safe for local development; production should always set SECRET_KEY.
     SECRET_KEY = secrets.token_hex(32)
 
 app.config.update(
@@ -61,7 +60,6 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 ADMIN_SECRET_PIN = os.environ.get("ADMIN_SECRET_PIN", "")
 APP_BASE_URL = os.environ.get("APP_BASE_URL", "").rstrip("/")
 
-# Keep OAuth secure; never enable insecure transport automatically in production.
 if os.environ.get("ALLOW_INSECURE_OAUTH", "0") == "1":
     os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
 os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
@@ -73,7 +71,6 @@ RATE_LIMIT_WINDOW = int(os.environ.get("RATE_LIMIT_WINDOW", "60"))
 RATE_LIMIT_MAX = int(os.environ.get("RATE_LIMIT_MAX", "8"))
 MAX_FILES_PER_EVENT = int(os.environ.get("MAX_FILES_PER_EVENT", "200"))
 
-# Safer allowlist for media uploads.
 ALLOWED_EXTENSIONS = {
     "jpg", "jpeg", "png", "webp", "gif",
     "mp4", "mov", "avi", "mkv", "webm",
@@ -217,7 +214,9 @@ def add_security_headers(response):
 def health_check():
     try:
         conn, _db_type = get_db_connection()
-        conn.execute("SELECT 1")
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1")
+        cursor.close()
         conn.close()
         return jsonify({"status": "ok", "service": "StudioFace AI", "database": "ok"}), 200
     except Exception:
@@ -263,7 +262,6 @@ def _add_sqlite_column(cursor, table, column, definition):
 
 
 def migrate_sqlite_legacy_schema(conn):
-    """Add the columns expected by the current app without deleting legacy data."""
     cursor = conn.cursor()
     tables = {r[0] for r in cursor.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
 
@@ -321,7 +319,6 @@ def migrate_sqlite_legacy_schema(conn):
         )
     """)
 
-    # Helpful indexes, all additive.
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_clients_email ON clients(email)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_events_client_id ON events(client_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_activity_timestamp ON activity_logs(timestamp)")
@@ -440,7 +437,8 @@ def get_drive_service(client_id):
                 cur2.execute(f"UPDATE clients SET google_tokens = {ph2} WHERE id = {ph2}", (json.dumps(refreshed), client_id))
                 conn2.commit()
             finally:
-                cur2.close(); conn2.close()
+                cur2.close()
+                conn2.close()
         return build("drive", "v3", credentials=creds, cache_discovery=False)
     except Exception as exc:
         app.logger.warning("Invalid/expired stored Google token: %s", exc)
@@ -726,8 +724,8 @@ def oauth2callback():
     ph = "%s" if db_type == "POSTGRES" else "?"
     try:
         cursor.execute(
-            f"UPDATE clients SET google_tokens = {ph} WHERE id = {ph} AND email = {ph}",
-            (json.dumps(stored_token), client_id_session, client_email_session),
+            f"UPDATE clients SET google_tokens = {ph} WHERE id = {ph}",
+            (json.dumps(stored_token), client_id_session),
         )
         conn.commit()
         log_activity(client_email_session, "GOOGLE_DRIVE_CONNECTED")
@@ -796,7 +794,6 @@ def api_create_event():
     if invalid:
         return jsonify({"success": False, "message": "One or more file types are not allowed."}), 400
 
-    # Prevent path-like names while keeping user-friendly filenames.
     safe_event_name = re.sub(r"[^\w\- .()&]+", "_", event_name).strip()[:120] or "Untitled Event"
 
     try:
@@ -841,7 +838,6 @@ def api_create_event():
                     (str(uuid.uuid4()), session["client_id"], event_uuid, event_name, event_date, event_folder_id),
                 )
             else:
-                # Works with both the legacy TEXT id schema and AUTOINCREMENT schemas.
                 cursor.execute(
                     "INSERT INTO events (client_id, event_id, event_name, event_date, drive_folder_id) VALUES (?,?,?,?,?)",
                     (session["client_id"], event_uuid, event_name, event_date, event_folder_id),
