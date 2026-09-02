@@ -186,6 +186,8 @@ def init_db():
                     google_tokens TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
+            """)
+            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS events (
                     id TEXT PRIMARY KEY,
                     client_id TEXT NOT NULL,
@@ -196,6 +198,8 @@ def init_db():
                     drive_folder_id TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
+            """)
+            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS event_media (
                     id TEXT PRIMARY KEY,
                     event_id TEXT NOT NULL,
@@ -206,6 +210,8 @@ def init_db():
                     face_encodings TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
+            """)
+            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS guest_leads (
                     id TEXT PRIMARY KEY,
                     event_id TEXT NOT NULL,
@@ -215,6 +221,8 @@ def init_db():
                     selfie_encoding TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
+            """)
+            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS activity_logs (
                     id BIGSERIAL PRIMARY KEY,
                     email TEXT,
@@ -225,8 +233,9 @@ def init_db():
                 );
             """)
             cursor.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS event_pin TEXT DEFAULT '1234';")
+            conn.commit()
         else:
-            cursor.execute("""
+            conn.executescript("""
                 CREATE TABLE IF NOT EXISTS clients (
                     id TEXT PRIMARY KEY,
                     studio_name TEXT NOT NULL,
@@ -275,7 +284,7 @@ def init_db():
                     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """)
-        conn.commit()
+            conn.commit()
     finally:
         cursor.close()
         conn.close()
@@ -393,7 +402,7 @@ def get_or_create_root_folder(service):
     return folder["id"]
 
 # -----------------------------------------------------------------------------
-# Routes
+# Routes: Core & Client Auth
 # -----------------------------------------------------------------------------
 @app.route("/")
 def index():
@@ -534,6 +543,9 @@ def oauth2callback():
         conn.close()
     return redirect(url_for("client_dashboard"))
 
+# -----------------------------------------------------------------------------
+# Studio Dashboard & Event Media Management
+# -----------------------------------------------------------------------------
 @app.route("/client/dashboard")
 @login_required
 def client_dashboard():
@@ -620,6 +632,94 @@ def api_create_event():
         cursor.close()
         conn.close()
 
+@app.route("/api/events/<event_id>/media", methods=["GET"])
+@login_required
+def api_get_event_media(event_id):
+    conn, db_type = get_db_connection()
+    cursor = conn.cursor()
+    ph = "%s" if db_type == "POSTGRES" else "?"
+    try:
+        cursor.execute(f"SELECT id, file_name, mime_type, drive_file_id, created_at FROM event_media WHERE event_id = {ph} AND client_id = {ph}", (event_id, session["client_id"]))
+        rows = cursor.fetchall()
+        media_list = [{"id": r[0], "file_name": r[1], "mime_type": r[2], "drive_file_id": r[3], "is_video": is_video(r[1])} for r in rows]
+        return jsonify({"success": True, "media": media_list})
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.route("/api/events/<event_id>/media/add", methods=["POST"])
+@login_required
+def api_insert_event_media(event_id):
+    service = get_drive_service(session["client_id"])
+    if not service:
+        return jsonify({"success": False, "message": "Drive connection lost."}), 400
+
+    conn, db_type = get_db_connection()
+    cursor = conn.cursor()
+    ph = "%s" if db_type == "POSTGRES" else "?"
+    cursor.execute(f"SELECT drive_folder_id FROM events WHERE event_id = {ph} AND client_id = {ph}", (event_id, session["client_id"]))
+    ev = cursor.fetchone()
+    if not ev:
+        cursor.close()
+        conn.close()
+        return jsonify({"success": False, "message": "Event not found."}), 404
+
+    folder_id = ev[0]
+    files = request.files.getlist("media_files") or request.files.getlist("files")
+    count = 0
+    try:
+        for up in files:
+            if not up or not allowed_file(up.filename):
+                continue
+            fn = secure_filename(up.filename)
+            file_bytes = up.read()
+            up.stream.seek(0)
+            media = MediaIoBaseUpload(BytesIO(file_bytes), mimetype=up.content_type or "application/octet-stream", resumable=True)
+            f_drive = service.files().create(body={"name": fn, "parents": [folder_id]}, media_body=media, fields="id").execute()
+
+            enc_json = "[]"
+            if not is_video(fn):
+                faces = extract_face_histograms(file_bytes)
+                enc_json = json.dumps(faces)
+
+            cursor.execute(
+                f"INSERT INTO event_media (id, event_id, client_id, drive_file_id, file_name, mime_type, face_encodings) VALUES ({ph},{ph},{ph},{ph},{ph},{ph},{ph})",
+                (str(uuid.uuid4()), event_id, session["client_id"], f_drive["id"], fn, up.content_type or "image/jpeg", enc_json)
+            )
+            count += 1
+        conn.commit()
+        return jsonify({"success": True, "message": f"{count} files added successfully."})
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.route("/api/events/<event_id>/media/<media_id>", methods=["DELETE"])
+@login_required
+def api_delete_event_media(event_id, media_id):
+    conn, db_type = get_db_connection()
+    cursor = conn.cursor()
+    ph = "%s" if db_type == "POSTGRES" else "?"
+    try:
+        cursor.execute(f"SELECT drive_file_id FROM event_media WHERE id = {ph} AND event_id = {ph} AND client_id = {ph}", (media_id, event_id, session["client_id"]))
+        row = cursor.fetchone()
+        if not row:
+            return jsonify({"success": False, "message": "Media item not found."}), 404
+        drive_file_id = row[0]
+
+        service = get_drive_service(session["client_id"])
+        if service:
+            try:
+                service.files().delete(fileId=drive_file_id).execute()
+            except Exception as e:
+                app.logger.warning("Could not delete from drive: %s", e)
+
+        cursor.execute(f"DELETE FROM event_media WHERE id = {ph}", (media_id,))
+        conn.commit()
+        return jsonify({"success": True, "message": "Media deleted successfully."})
+    finally:
+        cursor.close()
+        conn.close()
+
 # -----------------------------------------------------------------------------
 # Guest Face Search & Download Portal
 # -----------------------------------------------------------------------------
@@ -666,6 +766,13 @@ def api_guest_face_access(event_id):
             if selfie_faces:
                 guest_enc = selfie_faces[0]
 
+        lead_id = str(uuid.uuid4())
+        cursor.execute(
+            f"INSERT INTO guest_leads (id, event_id, guest_name, guest_phone, guest_email, selfie_encoding) VALUES ({ph},{ph},{ph},{ph},{ph},{ph})",
+            (lead_id, event_id, name, phone, email, json.dumps(guest_enc) if guest_enc else None)
+        )
+        conn.commit()
+
         cursor.execute(f"SELECT id, file_name, mime_type, drive_file_id, face_encodings FROM event_media WHERE event_id = {ph}", (event_id,))
         rows = cursor.fetchall()
 
@@ -702,6 +809,9 @@ def download_media_stream(client_id, drive_file_id, filename):
     fh.seek(0)
     return send_file(fh, as_attachment=True, download_name=secure_filename(filename))
 
+# -----------------------------------------------------------------------------
+# Entry Point
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=False)
