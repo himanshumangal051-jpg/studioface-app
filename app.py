@@ -18,7 +18,6 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 import requests
 import cv2
 import numpy as np
-from PIL import Image
 
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request as GoogleRequest
@@ -80,8 +79,15 @@ OTP_STORE = {}
 RATE_LIMIT_STORE = {}
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 
-# OpenCV Pre-trained Cascade for Face Detection
-FACE_CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+# Lazy face cascade loader to prevent worker crashes on start
+CASCADE_CACHE = None
+
+def get_face_cascade():
+    global CASCADE_CACHE
+    if CASCADE_CACHE is None:
+        xml_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+        CASCADE_CACHE = cv2.CascadeClassifier(xml_path)
+    return CASCADE_CACHE
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -112,16 +118,6 @@ def is_video(filename):
 def constant_time_equal(a, b):
     return hmac.compare_digest(str(a or ""), str(b or ""))
 
-def rate_limited(key, limit=RATE_LIMIT_MAX, window=RATE_LIMIT_WINDOW):
-    now = time.time()
-    recent = [ts for ts in RATE_LIMIT_STORE.get(key, []) if ts >= now - window]
-    if len(recent) >= limit:
-        RATE_LIMIT_STORE[key] = recent
-        return True
-    recent.append(now)
-    RATE_LIMIT_STORE[key] = recent
-    return False
-
 def csrf_token():
     token = session.get("csrf_token")
     if not token:
@@ -142,11 +138,11 @@ def validate_csrf():
 
 @app.before_request
 def csrf_guard():
-    if request.endpoint in {"static", "health_check"} or request.path.startswith("/event/"):
+    if request.endpoint in {"static", "health_check", "guest_event_portal", "api_guest_face_access", "download_media_stream"}:
         return None
     if not validate_csrf():
         if request.path.startswith("/api/"):
-            return jsonify({"success": False, "message": "Security token expired. Refresh and try again."}), 403
+            return jsonify({"success": False, "message": "Security token expired."}), 403
         return "Security token expired.", 403
     return None
 
@@ -159,7 +155,7 @@ def login_required(view):
     return wrapper
 
 # -----------------------------------------------------------------------------
-# Database Setup
+# Database Setup & Safe Migration
 # -----------------------------------------------------------------------------
 def get_db_connection():
     if DATABASE_URL and POSTGRES_AVAILABLE:
@@ -196,7 +192,7 @@ def init_db():
                     client_id TEXT NOT NULL,
                     event_id TEXT UNIQUE NOT NULL,
                     event_name TEXT NOT NULL,
-                    event_pin TEXT NOT NULL,
+                    event_pin TEXT DEFAULT '1234',
                     event_date TEXT NOT NULL,
                     drive_folder_id TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -229,6 +225,8 @@ def init_db():
                     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """)
+            # Add event_pin if existing table didn't have it
+            cursor.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS event_pin TEXT DEFAULT '1234';")
         else:
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS clients (
@@ -248,7 +246,7 @@ def init_db():
                     client_id TEXT NOT NULL,
                     event_id TEXT UNIQUE NOT NULL,
                     event_name TEXT NOT NULL,
-                    event_pin TEXT NOT NULL,
+                    event_pin TEXT DEFAULT '1234',
                     event_date TEXT NOT NULL,
                     drive_folder_id TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -294,31 +292,18 @@ def init_db():
 
 init_db()
 
-def log_activity(email, action, details=""):
-    try:
-        conn, db_type = get_db_connection()
-        cursor = conn.cursor()
-        ph = "%s" if db_type == "POSTGRES" else "?"
-        cursor.execute(f"INSERT INTO activity_logs (email, action, details, ip_address) VALUES ({ph}, {ph}, {ph}, {ph})",
-                       (email, action, details[:2000], client_ip()))
-        conn.commit()
-        cursor.close()
-        conn.close()
-    except Exception as exc:
-        app.logger.warning("Log activity failed: %s", exc)
-
 # -----------------------------------------------------------------------------
-# Lightweight Face Feature Extraction & Match
+# Face Extraction & Similarity Logic
 # -----------------------------------------------------------------------------
 def extract_face_histograms(image_bytes):
-    """Detects faces using Haar Cascade and extracts normalized 32x32 color features."""
     try:
+        cascade = get_face_cascade()
         np_arr = np.frombuffer(image_bytes, np.uint8)
         img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
         if img is None:
             return []
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        faces = FACE_CASCADE.detectMultiScale(gray, scaleFactor=1.2, minNeighbors=5, minSize=(60, 60))
+        faces = cascade.detectMultiScale(gray, scaleFactor=1.2, minNeighbors=5, minSize=(60, 60))
         encodings = []
         for (x, y, w, h) in faces:
             face_roi = gray[y:y+h, x:x+w]
@@ -330,11 +315,10 @@ def extract_face_histograms(image_bytes):
             encodings.append(hist.tolist())
         return encodings
     except Exception as err:
-        app.logger.error("Face extraction failed: %s", err)
+        app.logger.warning("Face processing failed: %s", err)
         return []
 
-def match_face(guest_vec, media_vecs_json, threshold=0.65):
-    """Compares guest face vector with saved photo face vectors using Cosine Similarity."""
+def match_face(guest_vec, media_vecs_json, threshold=0.60):
     if not media_vecs_json or not guest_vec:
         return False
     try:
@@ -350,7 +334,7 @@ def match_face(guest_vec, media_vecs_json, threshold=0.65):
     return False
 
 # -----------------------------------------------------------------------------
-# Google Drive Management
+# Google Drive Connection
 # -----------------------------------------------------------------------------
 def get_drive_service(client_id):
     conn, db_type = get_db_connection()
@@ -399,8 +383,7 @@ def get_drive_service(client_id):
                 cur2.execute(f"UPDATE clients SET google_tokens = {ph2} WHERE id = {ph2}", (json.dumps(refreshed), client_id))
                 conn2.commit()
             finally:
-                cur2.close()
-                conn2.close()
+                cur2.close(); conn2.close()
         return build("drive", "v3", credentials=creds, cache_discovery=False)
     except Exception as exc:
         app.logger.warning("Google Drive token error: %s", exc)
@@ -419,7 +402,7 @@ def get_or_create_root_folder(service):
     return folder["id"]
 
 # -----------------------------------------------------------------------------
-# Auth & Studio Routes
+# Routes
 # -----------------------------------------------------------------------------
 @app.route("/")
 def index():
@@ -427,7 +410,7 @@ def index():
 
 @app.route("/healthz")
 def health_check():
-    return jsonify({"status": "ok", "service": "StudioFace AI", "database": "ok"}), 200
+    return jsonify({"status": "ok", "service": "StudioFace AI"}), 200
 
 @app.route("/client/signup", methods=["GET", "POST"])
 def client_signup():
@@ -442,7 +425,7 @@ def client_signup():
     password = data.get("password", "")
 
     if not studio_name or not email or not password or len(password) < 8:
-        return render_template("client_signup.html", error="Fill required fields properly."), 400
+        return render_template("client_signup.html", error="Please fill all fields properly."), 400
 
     hashed_pw = generate_password_hash(password, method="scrypt")
     client_id = str(uuid.uuid4())
@@ -460,10 +443,9 @@ def client_signup():
         session.update({"client_id": client_id, "studio_name": studio_name, "client_email": email})
         return redirect(url_for("client_dashboard"))
     except Exception:
-        return render_template("client_signup.html", error="Email already exists."), 400
+        return render_template("client_signup.html", error="Email already registered."), 400
     finally:
-        cursor.close()
-        conn.close()
+        cursor.close(); conn.close()
 
 @app.route("/client/login", methods=["GET", "POST"])
 def client_login():
@@ -477,24 +459,20 @@ def client_login():
     ph = "%s" if db_type == "POSTGRES" else "?"
     cursor.execute(f"SELECT id, studio_name, password FROM clients WHERE email = {ph}", (email,))
     user = cursor.fetchone()
-    cursor.close()
-    conn.close()
+    cursor.close(); conn.close()
 
     if user and user[2] and check_password_hash(user[2], password):
         session.clear()
         session.permanent = True
         session.update({"client_id": user[0], "studio_name": user[1], "client_email": email})
         return redirect(url_for("client_dashboard"))
-    return render_template("client_login.html", error="Invalid credentials."), 401
+    return render_template("client_login.html", error="Invalid email or password."), 401
 
 @app.route("/client/logout")
 def client_logout():
     session.clear()
     return redirect(url_for("client_login"))
 
-# -----------------------------------------------------------------------------
-# Google OAuth Flow
-# -----------------------------------------------------------------------------
 @app.route("/connect-google")
 @login_required
 def google_connect():
@@ -514,8 +492,8 @@ def google_connect():
 @app.route("/oauth2callback")
 def oauth2callback():
     code = request.args.get("code")
-    client_id_session = session.get("client_id")
-    if not code or not client_id_session:
+    client_id = session.get("client_id")
+    if not code or not client_id:
         return redirect(url_for("client_login"))
 
     token_response = requests.post(
@@ -548,16 +526,12 @@ def oauth2callback():
     cursor = conn.cursor()
     ph = "%s" if db_type == "POSTGRES" else "?"
     try:
-        cursor.execute(f"UPDATE clients SET google_tokens = {ph} WHERE id = {ph}", (json.dumps(stored_token), client_id_session))
+        cursor.execute(f"UPDATE clients SET google_tokens = {ph} WHERE id = {ph}", (json.dumps(stored_token), client_id))
         conn.commit()
     finally:
-        cursor.close()
-        conn.close()
+        cursor.close(); conn.close()
     return redirect(url_for("client_dashboard"))
 
-# -----------------------------------------------------------------------------
-# Studio Dashboard & Event Media Management
-# -----------------------------------------------------------------------------
 @app.route("/client/dashboard")
 @login_required
 def client_dashboard():
@@ -574,8 +548,7 @@ def client_dashboard():
         events = cursor.fetchall()
         return render_template("client_dashboard.html", studio_name=client_row[2], has_drive=has_drive, events=events)
     finally:
-        cursor.close()
-        conn.close()
+        cursor.close(); conn.close()
 
 @app.route("/api/events/create", methods=["POST"])
 @login_required
@@ -622,7 +595,6 @@ def api_create_event():
             media = MediaIoBaseUpload(BytesIO(file_bytes), mimetype=up.content_type or "application/octet-stream", resumable=True)
             f_drive = service.files().create(body={"name": fn, "parents": [event_folder_id]}, media_body=media, fields="id").execute()
 
-            # Face extraction if image
             encodings_json = "[]"
             if not is_video(fn):
                 faces = extract_face_histograms(file_bytes)
@@ -642,106 +614,13 @@ def api_create_event():
             "share_url": f"/event/{event_uuid}"
         })
     finally:
-        cursor.close()
-        conn.close()
-
-@app.route("/api/events/<event_id>/media", methods=["GET"])
-@login_required
-def api_get_event_media(event_id):
-    """Fetches media list for client dashboard to manage files."""
-    conn, db_type = get_db_connection()
-    cursor = conn.cursor()
-    ph = "%s" if db_type == "POSTGRES" else "?"
-    try:
-        cursor.execute(f"SELECT id, file_name, mime_type, drive_file_id, created_at FROM event_media WHERE event_id = {ph} AND client_id = {ph}", (event_id, session["client_id"]))
-        rows = cursor.fetchall()
-        media_list = [{"id": r[0], "file_name": r[1], "mime_type": r[2], "drive_file_id": r[3], "is_video": is_video(r[1])} for r in rows]
-        return jsonify({"success": True, "media": media_list})
-    finally:
-        cursor.close()
-        conn.close()
-
-@app.route("/api/events/<event_id>/media/add", methods=["POST"])
-@login_required
-def api_insert_event_media(event_id):
-    """Allows client to upload additional photos/videos to an existing event."""
-    service = get_drive_service(session["client_id"])
-    if not service:
-        return jsonify({"success": False, "message": "Drive connection lost."}), 400
-
-    conn, db_type = get_db_connection()
-    cursor = conn.cursor()
-    ph = "%s" if db_type == "POSTGRES" else "?"
-    cursor.execute(f"SELECT drive_folder_id FROM events WHERE event_id = {ph} AND client_id = {ph}", (event_id, session["client_id"]))
-    ev = cursor.fetchone()
-    if not ev:
         cursor.close(); conn.close()
-        return jsonify({"success": False, "message": "Event not found."}), 404
-
-    folder_id = ev[0]
-    files = request.files.getlist("media_files") or request.files.getlist("files")
-    count = 0
-    try:
-        for up in files:
-            if not up or not allowed_file(up.filename):
-                continue
-            fn = secure_filename(up.filename)
-            file_bytes = up.read()
-            up.stream.seek(0)
-            media = MediaIoBaseUpload(BytesIO(file_bytes), mimetype=up.content_type or "application/octet-stream", resumable=True)
-            f_drive = service.files().create(body={"name": fn, "parents": [folder_id]}, media_body=media, fields="id").execute()
-
-            enc_json = "[]"
-            if not is_video(fn):
-                faces = extract_face_histograms(file_bytes)
-                enc_json = json.dumps(faces)
-
-            cursor.execute(
-                f"INSERT INTO event_media (id, event_id, client_id, drive_file_id, file_name, mime_type, face_encodings) VALUES ({ph},{ph},{ph},{ph},{ph},{ph},{ph})",
-                (str(uuid.uuid4()), event_id, session["client_id"], f_drive["id"], fn, up.content_type or "image/jpeg", enc_json)
-            )
-            count += 1
-        conn.commit()
-        return jsonify({"success": True, "message": f"{count} files added successfully."})
-    finally:
-        cursor.close()
-        conn.close()
-
-@app.route("/api/events/<event_id>/media/<media_id>", methods=["DELETE"])
-@login_required
-def api_delete_event_media(event_id, media_id):
-    """Deletes media from both PostgreSQL and Google Drive."""
-    conn, db_type = get_db_connection()
-    cursor = conn.cursor()
-    ph = "%s" if db_type == "POSTGRES" else "?"
-    try:
-        cursor.execute(f"SELECT drive_file_id FROM event_media WHERE id = {ph} AND event_id = {ph} AND client_id = {ph}", (media_id, event_id, session["client_id"]))
-        row = cursor.fetchone()
-        if not row:
-            return jsonify({"success": False, "message": "Media item not found."}), 404
-        drive_file_id = row[0]
-
-        # Delete from Drive
-        service = get_drive_service(session["client_id"])
-        if service:
-            try:
-                service.files().delete(fileId=drive_file_id).execute()
-            except Exception as e:
-                app.logger.warning("Could not delete from drive: %s", e)
-
-        cursor.execute(f"DELETE FROM event_media WHERE id = {ph}", (media_id,))
-        conn.commit()
-        return jsonify({"success": True, "message": "Media deleted successfully."})
-    finally:
-        cursor.close()
-        conn.close()
 
 # -----------------------------------------------------------------------------
-# Public Guest Portal & Face Matching Engine
+# Guest Face Search & Download Portal
 # -----------------------------------------------------------------------------
 @app.route("/event/<event_id>")
 def guest_event_portal(event_id):
-    """Public portal page for guests to enter details and get their photos."""
     conn, db_type = get_db_connection()
     cursor = conn.cursor()
     ph = "%s" if db_type == "POSTGRES" else "?"
@@ -749,15 +628,13 @@ def guest_event_portal(event_id):
         cursor.execute(f"SELECT e.event_name, e.event_date, c.studio_name FROM events e JOIN clients c ON e.client_id = c.id WHERE e.event_id = {ph}", (event_id,))
         row = cursor.fetchone()
         if not row:
-            return "Event not found or has been removed.", 404
+            return "Event not found.", 404
         return render_template("guest_portal.html", event_id=event_id, event_name=row[0], event_date=row[1], studio_name=row[2])
     finally:
-        cursor.close()
-        conn.close()
+        cursor.close(); conn.close()
 
 @app.route("/api/event/<event_id>/guest-access", methods=["POST"])
 def api_guest_face_access(event_id):
-    """Collects guest contact details, selfie, validates PIN, and returns only matched media."""
     name = request.form.get("guest_name", "").strip()
     phone = request.form.get("guest_phone", "").strip()
     email = request.form.get("guest_email", "").strip()
@@ -765,21 +642,18 @@ def api_guest_face_access(event_id):
     selfie = request.files.get("selfie")
 
     if not name or not phone or not pin:
-        return jsonify({"success": False, "message": "Name, phone number and PIN are required."}), 400
+        return jsonify({"success": False, "message": "Name, phone and PIN are required."}), 400
 
     conn, db_type = get_db_connection()
     cursor = conn.cursor()
     ph = "%s" if db_type == "POSTGRES" else "?"
     try:
-        # Verify Event & PIN
         cursor.execute(f"SELECT event_pin, client_id FROM events WHERE event_id = {ph}", (event_id,))
         ev = cursor.fetchone()
         if not ev or not constant_time_equal(ev[0], pin):
             return jsonify({"success": False, "message": "Invalid Event PIN."}), 403
 
         client_id = ev[1]
-
-        # Extract guest face features
         guest_enc = None
         if selfie and selfie.filename:
             selfie_bytes = selfie.read()
@@ -787,25 +661,14 @@ def api_guest_face_access(event_id):
             if selfie_faces:
                 guest_enc = selfie_faces[0]
 
-        # Save lead to database
-        lead_id = str(uuid.uuid4())
-        cursor.execute(
-            f"INSERT INTO guest_leads (id, event_id, guest_name, guest_phone, guest_email, selfie_encoding) VALUES ({ph},{ph},{ph},{ph},{ph},{ph})",
-            (lead_id, event_id, name, phone, email, json.dumps(guest_enc) if guest_enc else None)
-        )
-        conn.commit()
-
-        # Retrieve all media for this event
         cursor.execute(f"SELECT id, file_name, mime_type, drive_file_id, face_encodings FROM event_media WHERE event_id = {ph}", (event_id,))
         rows = cursor.fetchall()
 
         matched_media = []
         for r in rows:
             mid, fn, mime, df_id, f_enc_json = r[0], r[1], r[2], r[3], r[4]
-            # Videos are available for all event guests
             if is_video(fn):
                 matched_media.append({"id": mid, "file_name": fn, "type": "video", "download_url": f"/media/download/{client_id}/{df_id}/{fn}"})
-            # Photos are filtered by face match
             elif guest_enc and match_face(guest_enc, f_enc_json):
                 matched_media.append({"id": mid, "file_name": fn, "type": "photo", "download_url": f"/media/download/{client_id}/{df_id}/{fn}"})
 
@@ -816,12 +679,10 @@ def api_guest_face_access(event_id):
             "media": matched_media
         })
     finally:
-        cursor.close()
-        conn.close()
+        cursor.close(); conn.close()
 
 @app.route("/media/download/<client_id>/<drive_file_id>/<filename>")
 def download_media_stream(client_id, drive_file_id, filename):
-    """Direct high-speed streaming download from Google Drive to guest gallery."""
     service = get_drive_service(client_id)
     if not service:
         return "Authentication error.", 403
@@ -835,9 +696,6 @@ def download_media_stream(client_id, drive_file_id, filename):
     fh.seek(0)
     return send_file(fh, as_attachment=True, download_name=secure_filename(filename))
 
-# -----------------------------------------------------------------------------
-# Entry Point
-# -----------------------------------------------------------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=False)
