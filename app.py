@@ -79,7 +79,6 @@ OTP_STORE = {}
 RATE_LIMIT_STORE = {}
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 
-# Lazy face cascade loader to prevent worker crashes on start
 CASCADE_CACHE = None
 
 def get_face_cascade():
@@ -225,7 +224,6 @@ def init_db():
                     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """)
-            # Add event_pin if existing table didn't have it
             cursor.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS event_pin TEXT DEFAULT '1234';")
         else:
             cursor.execute("""
@@ -239,8 +237,6 @@ def init_db():
                     google_tokens TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
-            """)
-            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS events (
                     id TEXT PRIMARY KEY,
                     client_id TEXT NOT NULL,
@@ -251,8 +247,6 @@ def init_db():
                     drive_folder_id TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
-            """)
-            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS event_media (
                     id TEXT PRIMARY KEY,
                     event_id TEXT NOT NULL,
@@ -263,8 +257,6 @@ def init_db():
                     face_encodings TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
-            """)
-            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS guest_leads (
                     id TEXT PRIMARY KEY,
                     event_id TEXT NOT NULL,
@@ -274,8 +266,6 @@ def init_db():
                     selfie_encoding TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
-            """)
-            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS activity_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     email TEXT,
@@ -383,7 +373,8 @@ def get_drive_service(client_id):
                 cur2.execute(f"UPDATE clients SET google_tokens = {ph2} WHERE id = {ph2}", (json.dumps(refreshed), client_id))
                 conn2.commit()
             finally:
-                cur2.close(); conn2.close()
+                cur2.close()
+                conn2.close()
         return build("drive", "v3", credentials=creds, cache_discovery=False)
     except Exception as exc:
         app.logger.warning("Google Drive token error: %s", exc)
@@ -407,6 +398,14 @@ def get_or_create_root_folder(service):
 @app.route("/")
 def index():
     return render_template("index.html")
+
+@app.route("/privacy")
+def privacy():
+    return render_template("privacy.html")
+
+@app.route("/terms")
+def terms():
+    return render_template("terms.html")
 
 @app.route("/healthz")
 def health_check():
@@ -445,7 +444,8 @@ def client_signup():
     except Exception:
         return render_template("client_signup.html", error="Email already registered."), 400
     finally:
-        cursor.close(); conn.close()
+        cursor.close()
+        conn.close()
 
 @app.route("/client/login", methods=["GET", "POST"])
 def client_login():
@@ -459,7 +459,8 @@ def client_login():
     ph = "%s" if db_type == "POSTGRES" else "?"
     cursor.execute(f"SELECT id, studio_name, password FROM clients WHERE email = {ph}", (email,))
     user = cursor.fetchone()
-    cursor.close(); conn.close()
+    cursor.close()
+    conn.close()
 
     if user and user[2] and check_password_hash(user[2], password):
         session.clear()
@@ -529,7 +530,8 @@ def oauth2callback():
         cursor.execute(f"UPDATE clients SET google_tokens = {ph} WHERE id = {ph}", (json.dumps(stored_token), client_id))
         conn.commit()
     finally:
-        cursor.close(); conn.close()
+        cursor.close()
+        conn.close()
     return redirect(url_for("client_dashboard"))
 
 @app.route("/client/dashboard")
@@ -548,7 +550,8 @@ def client_dashboard():
         events = cursor.fetchall()
         return render_template("client_dashboard.html", studio_name=client_row[2], has_drive=has_drive, events=events)
     finally:
-        cursor.close(); conn.close()
+        cursor.close()
+        conn.close()
 
 @app.route("/api/events/create", methods=["POST"])
 @login_required
@@ -614,7 +617,8 @@ def api_create_event():
             "share_url": f"/event/{event_uuid}"
         })
     finally:
-        cursor.close(); conn.close()
+        cursor.close()
+        conn.close()
 
 # -----------------------------------------------------------------------------
 # Guest Face Search & Download Portal
@@ -631,7 +635,8 @@ def guest_event_portal(event_id):
             return "Event not found.", 404
         return render_template("guest_portal.html", event_id=event_id, event_name=row[0], event_date=row[1], studio_name=row[2])
     finally:
-        cursor.close(); conn.close()
+        cursor.close()
+        conn.close()
 
 @app.route("/api/event/<event_id>/guest-access", methods=["POST"])
 def api_guest_face_access(event_id):
@@ -679,7 +684,8 @@ def api_guest_face_access(event_id):
             "media": matched_media
         })
     finally:
-        cursor.close(); conn.close()
+        cursor.close()
+        conn.close()
 
 @app.route("/media/download/<client_id>/<drive_file_id>/<filename>")
 def download_media_stream(client_id, drive_file_id, filename):
