@@ -412,6 +412,16 @@ def get_drive_service(client_id):
         token_info = json.loads(row[0])
         if not token_info.get("token"):
             return None
+
+        # Fix: Convert expiry to a naive UTC datetime to avoid comparison crash
+        expiry_dt = None
+        if token_info.get("expiry"):
+            raw_expiry = dt.datetime.fromisoformat(token_info["expiry"])
+            if raw_expiry.tzinfo is not None:
+                expiry_dt = raw_expiry.astimezone(dt.timezone.utc).replace(tzinfo=None)
+            else:
+                expiry_dt = raw_expiry
+
         creds = Credentials(
             token=token_info.get("token"),
             refresh_token=token_info.get("refresh_token"),
@@ -419,7 +429,7 @@ def get_drive_service(client_id):
             client_id=GOOGLE_CLIENT_ID,
             client_secret=GOOGLE_CLIENT_SECRET,
             scopes=SCOPES,
-            expiry=dt.datetime.fromisoformat(token_info["expiry"]) if token_info.get("expiry") else None,
+            expiry=expiry_dt,
         )
         if creds.expired and creds.refresh_token:
             creds.refresh(GoogleRequest())
