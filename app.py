@@ -11,16 +11,19 @@ from io import BytesIO
 import urllib.parse
 from functools import wraps
 
-from flask import Flask, render_template, request, redirect, url_for, session, jsonify
+from flask import Flask, render_template, request, redirect, url_for, session, jsonify, send_file
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 from werkzeug.middleware.proxy_fix import ProxyFix
 import requests
+import cv2
+import numpy as np
+from PIL import Image
 
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request as GoogleRequest
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
+from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 
 try:
     import psycopg2
@@ -38,13 +41,11 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 DB_PATH = os.path.join(BASE_DIR, "face_engine.db")
 
-SECRET_KEY = os.environ.get("SECRET_KEY")
-if not SECRET_KEY:
-    SECRET_KEY = secrets.token_hex(32)
+SECRET_KEY = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
 
 app.config.update(
     SECRET_KEY=SECRET_KEY,
-    MAX_CONTENT_LENGTH=int(os.environ.get("MAX_CONTENT_LENGTH", str(250 * 1024 * 1024))),
+    MAX_CONTENT_LENGTH=int(os.environ.get("MAX_CONTENT_LENGTH", str(500 * 1024 * 1024))),
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
     SESSION_COOKIE_SECURE=os.environ.get("SESSION_COOKIE_SECURE", "1") == "1",
@@ -68,18 +69,19 @@ OTP_TTL_SECONDS = int(os.environ.get("OTP_TTL_SECONDS", "600"))
 OTP_MAX_ATTEMPTS = int(os.environ.get("OTP_MAX_ATTEMPTS", "5"))
 OTP_RESEND_COOLDOWN = int(os.environ.get("OTP_RESEND_COOLDOWN", "60"))
 RATE_LIMIT_WINDOW = int(os.environ.get("RATE_LIMIT_WINDOW", "60"))
-RATE_LIMIT_MAX = int(os.environ.get("RATE_LIMIT_MAX", "8"))
-MAX_FILES_PER_EVENT = int(os.environ.get("MAX_FILES_PER_EVENT", "200"))
+RATE_LIMIT_MAX = int(os.environ.get("RATE_LIMIT_MAX", "10"))
+MAX_FILES_PER_EVENT = int(os.environ.get("MAX_FILES_PER_EVENT", "300"))
 
-ALLOWED_EXTENSIONS = {
-    "jpg", "jpeg", "png", "webp", "gif",
-    "mp4", "mov", "avi", "mkv", "webm",
-    "mp3", "wav", "m4a", "aac"
-}
+ALLOWED_IMG = {"jpg", "jpeg", "png", "webp"}
+ALLOWED_VID = {"mp4", "mov", "webm", "mkv"}
+ALLOWED_EXTENSIONS = ALLOWED_IMG | ALLOWED_VID
 
 OTP_STORE = {}
 RATE_LIMIT_STORE = {}
-SCOPES = ["https://www.googleapis.com/auth/drive.file"]
+SCOPES = ["https://www.googleapis.com/auth/drive"]
+
+# OpenCV Pre-trained Cascade for Face Detection
+FACE_CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -87,50 +89,30 @@ SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 def now_utc():
     return dt.datetime.now(dt.timezone.utc)
 
-
 def client_ip():
     forwarded = request.headers.get("X-Forwarded-For", "")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.remote_addr or "unknown"
-
+    return forwarded.split(",")[0].strip() if forwarded else request.remote_addr or "unknown"
 
 def configured_redirect_uri():
     if APP_BASE_URL:
         return f"{APP_BASE_URL}/oauth2callback"
     return url_for("oauth2callback", _external=True, _scheme="https")
 
-
 def require_config(*names):
     missing = [name for name, value in names if not value]
     if missing:
         raise RuntimeError(f"Missing required configuration: {', '.join(missing)}")
 
-
 def allowed_file(filename):
     return bool(filename and "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS)
 
+def is_video(filename):
+    return bool(filename and "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_VID)
 
 def constant_time_equal(a, b):
     return hmac.compare_digest(str(a or ""), str(b or ""))
 
-
-def cleanup_ephemeral_stores():
-    cutoff = time.time() - max(OTP_TTL_SECONDS, RATE_LIMIT_WINDOW) * 2
-    for key in list(OTP_STORE):
-        created = OTP_STORE[key].get("created_at", 0)
-        if created < cutoff:
-            OTP_STORE.pop(key, None)
-    for key in list(RATE_LIMIT_STORE):
-        items = [ts for ts in RATE_LIMIT_STORE[key] if ts >= time.time() - RATE_LIMIT_WINDOW]
-        if items:
-            RATE_LIMIT_STORE[key] = items
-        else:
-            RATE_LIMIT_STORE.pop(key, None)
-
-
 def rate_limited(key, limit=RATE_LIMIT_MAX, window=RATE_LIMIT_WINDOW):
-    cleanup_ephemeral_stores()
     now = time.time()
     recent = [ts for ts in RATE_LIMIT_STORE.get(key, []) if ts >= now - window]
     if len(recent) >= limit:
@@ -140,7 +122,6 @@ def rate_limited(key, limit=RATE_LIMIT_MAX, window=RATE_LIMIT_WINDOW):
     RATE_LIMIT_STORE[key] = recent
     return False
 
-
 def csrf_token():
     token = session.get("csrf_token")
     if not token:
@@ -148,93 +129,37 @@ def csrf_token():
         session["csrf_token"] = token
     return token
 
-
 @app.context_processor
 def inject_security_helpers():
     return {"csrf_token": csrf_token()}
 
-
 def validate_csrf():
     if request.method in {"GET", "HEAD", "OPTIONS"}:
         return True
-    supplied = request.headers.get("X-CSRF-Token")
-    if not supplied:
-        supplied = request.form.get("csrf_token")
+    supplied = request.headers.get("X-CSRF-Token") or request.form.get("csrf_token")
     expected = session.get("csrf_token")
     return bool(expected and supplied and constant_time_equal(expected, supplied))
 
-
 @app.before_request
 def csrf_guard():
-    if request.endpoint in {"static", "health_check"}:
+    if request.endpoint in {"static", "health_check"} or request.path.startswith("/event/"):
         return None
     if not validate_csrf():
         if request.path.startswith("/api/"):
-            return jsonify({"success": False, "message": "Security token expired. Refresh the page and try again."}), 403
-        return "Security token expired. Refresh the page and try again.", 403
+            return jsonify({"success": False, "message": "Security token expired. Refresh and try again."}), 403
+        return "Security token expired.", 403
     return None
-
 
 def login_required(view):
     @wraps(view)
     def wrapper(*args, **kwargs):
         if not session.get("client_id"):
-            if request.path.startswith("/api/"):
-                return jsonify({"success": False, "message": "Authentication required."}), 401
             return redirect(url_for("client_login"))
         return view(*args, **kwargs)
     return wrapper
 
-
-def admin_required(view):
-    @wraps(view)
-    def wrapper(*args, **kwargs):
-        if not session.get("is_admin"):
-            return render_template("admin_activity.html", authenticated=False), 403
-        return view(*args, **kwargs)
-    return wrapper
-
 # -----------------------------------------------------------------------------
-# Security headers
-# -----------------------------------------------------------------------------
-@app.after_request
-def add_security_headers(response):
-    response.headers.setdefault("X-Content-Type-Options", "nosniff")
-    response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
-    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
-    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
-    if request.is_secure:
-        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
-    return response
-
-# -----------------------------------------------------------------------------
-# Health check
-# -----------------------------------------------------------------------------
-@app.route("/healthz")
-def health_check():
-    try:
-        conn, _db_type = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT 1")
-        cursor.close()
-        conn.close()
-        return jsonify({"status": "ok", "service": "StudioFace AI", "database": "ok"}), 200
-    except Exception:
-        app.logger.exception("Health check database failure")
-        return jsonify({"status": "degraded", "service": "StudioFace AI", "database": "error"}), 503
-
-
-@app.route("/privacy")
-def privacy():
-    return render_template("privacy.html")
-
-
-@app.route("/terms")
-def terms():
-    return render_template("terms.html")
-
-# -----------------------------------------------------------------------------
-# Database
+# Database Setup
 # -----------------------------------------------------------------------------
 def get_db_connection():
     if DATABASE_URL and POSTGRES_AVAILABLE:
@@ -249,82 +174,6 @@ def get_db_connection():
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
     return conn, "SQLITE"
-
-
-def _sqlite_columns(cursor, table):
-    return {row[1] for row in cursor.execute(f"PRAGMA table_info({table})").fetchall()}
-
-
-def _add_sqlite_column(cursor, table, column, definition):
-    columns = _sqlite_columns(cursor, table)
-    if column not in columns:
-        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-
-
-def migrate_sqlite_legacy_schema(conn):
-    cursor = conn.cursor()
-    tables = {r[0] for r in cursor.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-
-    if "clients" not in tables:
-        cursor.execute("""
-            CREATE TABLE clients (
-                id TEXT PRIMARY KEY,
-                studio_name TEXT NOT NULL,
-                owner_name TEXT NOT NULL,
-                email TEXT UNIQUE NOT NULL,
-                phone TEXT NOT NULL,
-                password TEXT NOT NULL,
-                google_tokens TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-    else:
-        _add_sqlite_column(cursor, "clients", "owner_name", "TEXT")
-        _add_sqlite_column(cursor, "clients", "phone", "TEXT")
-        _add_sqlite_column(cursor, "clients", "password", "TEXT")
-        _add_sqlite_column(cursor, "clients", "google_tokens", "TEXT")
-        cursor.execute("UPDATE clients SET owner_name = COALESCE(owner_name, studio_name) WHERE owner_name IS NULL OR owner_name = ''")
-        cursor.execute("UPDATE clients SET phone = COALESCE(phone, '') WHERE phone IS NULL")
-        cursor.execute("UPDATE clients SET password = password_hash WHERE (password IS NULL OR password = '') AND password_hash IS NOT NULL")
-
-    if "events" not in tables:
-        cursor.execute("""
-            CREATE TABLE events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                client_id TEXT NOT NULL,
-                event_id TEXT UNIQUE NOT NULL,
-                event_name TEXT NOT NULL,
-                event_date TEXT NOT NULL,
-                drive_folder_id TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-    else:
-        _add_sqlite_column(cursor, "events", "event_id", "TEXT")
-        _add_sqlite_column(cursor, "events", "event_name", "TEXT")
-        _add_sqlite_column(cursor, "events", "event_date", "TEXT")
-        _add_sqlite_column(cursor, "events", "drive_folder_id", "TEXT")
-        cursor.execute("UPDATE events SET event_id = COALESCE(event_id, id) WHERE event_id IS NULL OR event_id = ''")
-        cursor.execute("UPDATE events SET event_name = COALESCE(event_name, name, 'Untitled Event') WHERE event_name IS NULL OR event_name = ''")
-        cursor.execute("UPDATE events SET event_date = COALESCE(event_date, substr(created_at, 1, 10), date('now')) WHERE event_date IS NULL OR event_date = ''")
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS activity_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            email TEXT,
-            action TEXT NOT NULL,
-            details TEXT,
-            ip_address TEXT,
-            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_clients_email ON clients(email)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_events_client_id ON events(client_id)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_activity_timestamp ON activity_logs(timestamp)")
-    conn.commit()
-    cursor.close()
-
 
 def init_db():
     conn, db_type = get_db_connection()
@@ -341,20 +190,36 @@ def init_db():
                     password TEXT NOT NULL,
                     google_tokens TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            cursor.execute("""
+                );
                 CREATE TABLE IF NOT EXISTS events (
                     id TEXT PRIMARY KEY,
                     client_id TEXT NOT NULL,
                     event_id TEXT UNIQUE NOT NULL,
                     event_name TEXT NOT NULL,
+                    event_pin TEXT NOT NULL,
                     event_date TEXT NOT NULL,
                     drive_folder_id TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            cursor.execute("""
+                );
+                CREATE TABLE IF NOT EXISTS event_media (
+                    id TEXT PRIMARY KEY,
+                    event_id TEXT NOT NULL,
+                    client_id TEXT NOT NULL,
+                    drive_file_id TEXT NOT NULL,
+                    file_name TEXT NOT NULL,
+                    mime_type TEXT NOT NULL,
+                    face_encodings TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS guest_leads (
+                    id TEXT PRIMARY KEY,
+                    event_id TEXT NOT NULL,
+                    guest_name TEXT NOT NULL,
+                    guest_phone TEXT NOT NULL,
+                    guest_email TEXT,
+                    selfie_encoding TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
                 CREATE TABLE IF NOT EXISTS activity_logs (
                     id BIGSERIAL PRIMARY KEY,
                     email TEXT,
@@ -362,39 +227,130 @@ def init_db():
                     details TEXT,
                     ip_address TEXT,
                     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
+                );
             """)
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_pg_clients_email ON clients(email)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_pg_events_client_id ON events(client_id)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_pg_activity_timestamp ON activity_logs(timestamp)")
-            conn.commit()
         else:
-            migrate_sqlite_legacy_schema(conn)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS clients (
+                    id TEXT PRIMARY KEY,
+                    studio_name TEXT NOT NULL,
+                    owner_name TEXT NOT NULL,
+                    email TEXT UNIQUE NOT NULL,
+                    phone TEXT NOT NULL,
+                    password TEXT NOT NULL,
+                    google_tokens TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS events (
+                    id TEXT PRIMARY KEY,
+                    client_id TEXT NOT NULL,
+                    event_id TEXT UNIQUE NOT NULL,
+                    event_name TEXT NOT NULL,
+                    event_pin TEXT NOT NULL,
+                    event_date TEXT NOT NULL,
+                    drive_folder_id TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS event_media (
+                    id TEXT PRIMARY KEY,
+                    event_id TEXT NOT NULL,
+                    client_id TEXT NOT NULL,
+                    drive_file_id TEXT NOT NULL,
+                    file_name TEXT NOT NULL,
+                    mime_type TEXT NOT NULL,
+                    face_encodings TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS guest_leads (
+                    id TEXT PRIMARY KEY,
+                    event_id TEXT NOT NULL,
+                    guest_name TEXT NOT NULL,
+                    guest_phone TEXT NOT NULL,
+                    guest_email TEXT,
+                    selfie_encoding TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS activity_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    email TEXT,
+                    action TEXT NOT NULL,
+                    details TEXT,
+                    ip_address TEXT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+        conn.commit()
     finally:
         cursor.close()
         conn.close()
 
-
 init_db()
-
 
 def log_activity(email, action, details=""):
     try:
         conn, db_type = get_db_connection()
         cursor = conn.cursor()
-        placeholder = "%s" if db_type == "POSTGRES" else "?"
-        cursor.execute(
-            f"INSERT INTO activity_logs (email, action, details, ip_address) VALUES ({placeholder}, {placeholder}, {placeholder}, {placeholder})",
-            (email, action, details[:2000], client_ip()),
-        )
+        ph = "%s" if db_type == "POSTGRES" else "?"
+        cursor.execute(f"INSERT INTO activity_logs (email, action, details, ip_address) VALUES ({ph}, {ph}, {ph}, {ph})",
+                       (email, action, details[:2000], client_ip()))
         conn.commit()
         cursor.close()
         conn.close()
     except Exception as exc:
-        app.logger.warning("Activity log error: %s", exc)
+        app.logger.warning("Log activity failed: %s", exc)
 
 # -----------------------------------------------------------------------------
-# Google Drive
+# Lightweight Face Feature Extraction & Match
+# -----------------------------------------------------------------------------
+def extract_face_histograms(image_bytes):
+    """Detects faces using Haar Cascade and extracts normalized 32x32 color features."""
+    try:
+        np_arr = np.frombuffer(image_bytes, np.uint8)
+        img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        if img is None:
+            return []
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        faces = FACE_CASCADE.detectMultiScale(gray, scaleFactor=1.2, minNeighbors=5, minSize=(60, 60))
+        encodings = []
+        for (x, y, w, h) in faces:
+            face_roi = gray[y:y+h, x:x+w]
+            face_resized = cv2.resize(face_roi, (32, 32))
+            hist = cv2.equalizeHist(face_resized).flatten().astype("float32")
+            norm = np.linalg.norm(hist)
+            if norm > 0:
+                hist /= norm
+            encodings.append(hist.tolist())
+        return encodings
+    except Exception as err:
+        app.logger.error("Face extraction failed: %s", err)
+        return []
+
+def match_face(guest_vec, media_vecs_json, threshold=0.65):
+    """Compares guest face vector with saved photo face vectors using Cosine Similarity."""
+    if not media_vecs_json or not guest_vec:
+        return False
+    try:
+        target = np.array(guest_vec, dtype="float32")
+        media_vecs = json.loads(media_vecs_json)
+        for vec in media_vecs:
+            v = np.array(vec, dtype="float32")
+            sim = np.dot(target, v)
+            if sim >= threshold:
+                return True
+    except Exception:
+        return False
+    return False
+
+# -----------------------------------------------------------------------------
+# Google Drive Management
 # -----------------------------------------------------------------------------
 def get_drive_service(client_id):
     conn, db_type = get_db_connection()
@@ -413,14 +369,10 @@ def get_drive_service(client_id):
         if not token_info.get("token"):
             return None
 
-        # Fix: Convert expiry to a naive UTC datetime to avoid comparison crash
         expiry_dt = None
         if token_info.get("expiry"):
-            raw_expiry = dt.datetime.fromisoformat(token_info["expiry"])
-            if raw_expiry.tzinfo is not None:
-                expiry_dt = raw_expiry.astimezone(dt.timezone.utc).replace(tzinfo=None)
-            else:
-                expiry_dt = raw_expiry
+            raw = dt.datetime.fromisoformat(token_info["expiry"])
+            expiry_dt = raw.astimezone(dt.timezone.utc).replace(tzinfo=None) if raw.tzinfo else raw
 
         creds = Credentials(
             token=token_info.get("token"),
@@ -451,9 +403,8 @@ def get_drive_service(client_id):
                 conn2.close()
         return build("drive", "v3", credentials=creds, cache_discovery=False)
     except Exception as exc:
-        app.logger.warning("Invalid/expired stored Google token: %s", exc)
+        app.logger.warning("Google Drive token error: %s", exc)
         return None
-
 
 def get_or_create_root_folder(service):
     query = "name = 'StudioFace Events' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
@@ -468,43 +419,15 @@ def get_or_create_root_folder(service):
     return folder["id"]
 
 # -----------------------------------------------------------------------------
-# OTP / Email
-# -----------------------------------------------------------------------------
-def send_email_otp(recipient_email, otp):
-    require_config(("BREVO_API_KEY", BREVO_API_KEY), ("BREVO_SENDER_EMAIL", BREVO_SENDER_EMAIL))
-    response = requests.post(
-        "https://api.brevo.com/v3/smtp/email",
-        headers={
-            "api-key": BREVO_API_KEY,
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
-        json={
-            "sender": {"name": BREVO_SENDER_NAME, "email": BREVO_SENDER_EMAIL},
-            "to": [{"email": recipient_email}],
-            "subject": "Your StudioFace verification code",
-            "htmlContent": f"""
-            <div style=\"font-family:Arial,sans-serif;max-width:440px;margin:auto;padding:24px;background:#0F172A;border-radius:16px;color:#F8FAFC;text-align:center\">
-              <h2 style=\"color:#6366F1\">StudioFace AI</h2>
-              <p style=\"color:#94A3B8\">Your verification code is:</p>
-              <div style=\"background:#1E293B;border-radius:12px;padding:18px;margin:20px 0;border:1px dashed #6366F1\">
-                <span style=\"font-size:32px;font-weight:800;letter-spacing:6px;color:#818CF8;font-family:monospace\">{otp}</span>
-              </div>
-              <p style=\"color:#64748B;font-size:12px\">This code expires in {OTP_TTL_SECONDS // 60} minutes.</p>
-            </div>
-            """,
-        },
-        timeout=10,
-    )
-    return response.status_code in (200, 201, 202), response.text
-
-# -----------------------------------------------------------------------------
-# Routes: public / client auth
+# Auth & Studio Routes
 # -----------------------------------------------------------------------------
 @app.route("/")
 def index():
     return render_template("index.html")
 
+@app.route("/healthz")
+def health_check():
+    return jsonify({"status": "ok", "service": "StudioFace AI", "database": "ok"}), 200
 
 @app.route("/client/signup", methods=["GET", "POST"])
 def client_signup():
@@ -517,24 +440,9 @@ def client_signup():
     email = data.get("email", "").strip().lower()
     phone = data.get("phone", "").strip()
     password = data.get("password", "")
-    otp = data.get("otp", "").strip()
 
-    if not studio_name or not email or not password:
-        return render_template("client_signup.html", error="Studio name, email and password are required."), 400
-    if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
-        return render_template("client_signup.html", error="Please enter a valid email address."), 400
-    if len(password) < 8:
-        return render_template("client_signup.html", error="Password must be at least 8 characters."), 400
-
-    otp_entry = OTP_STORE.get(email)
-    verified_email = session.get("verified_email") == email
-    otp_valid = verified_email
-    if not otp_valid and otp_entry:
-        age = time.time() - otp_entry.get("created_at", 0)
-        if age <= OTP_TTL_SECONDS and otp_entry.get("attempts", 0) < OTP_MAX_ATTEMPTS:
-            otp_valid = constant_time_equal(otp_entry.get("otp"), otp)
-    if not otp_valid:
-        return render_template("client_signup.html", error="Invalid or expired OTP. Please verify again."), 400
+    if not studio_name or not email or not password or len(password) < 8:
+        return render_template("client_signup.html", error="Fill required fields properly."), 400
 
     hashed_pw = generate_password_hash(password, method="scrypt")
     client_id = str(uuid.uuid4())
@@ -550,27 +458,19 @@ def client_signup():
         session.clear()
         session.permanent = True
         session.update({"client_id": client_id, "studio_name": studio_name, "client_email": email})
-        OTP_STORE.pop(email, None)
-        log_activity(email, "SIGNUP_SUCCESS", f"Studio: {studio_name}")
         return redirect(url_for("client_dashboard"))
-    except Exception as exc:
-        conn.rollback()
-        log_activity(email, "SIGNUP_FAILED", str(exc))
-        return render_template("client_signup.html", error="An account with this email may already exist."), 400
+    except Exception:
+        return render_template("client_signup.html", error="Email already exists."), 400
     finally:
         cursor.close()
         conn.close()
-
 
 @app.route("/client/login", methods=["GET", "POST"])
 def client_login():
     if request.method == "GET":
         return render_template("client_login.html")
-
     email = request.form.get("email", "").strip().lower()
     password = request.form.get("password", "")
-    if rate_limited(f"login:{client_ip()}:{email}", limit=8, window=60):
-        return render_template("client_login.html", error="Too many attempts. Please try again later."), 429
 
     conn, db_type = get_db_connection()
     cursor = conn.cursor()
@@ -584,123 +484,39 @@ def client_login():
         session.clear()
         session.permanent = True
         session.update({"client_id": user[0], "studio_name": user[1], "client_email": email})
-        log_activity(email, "LOGIN_SUCCESS")
         return redirect(url_for("client_dashboard"))
-
-    log_activity(email, "LOGIN_FAILED")
-    return render_template("client_login.html", error="Invalid email or password."), 401
-
+    return render_template("client_login.html", error="Invalid credentials."), 401
 
 @app.route("/client/logout")
 def client_logout():
-    email = session.get("client_email", "unknown")
-    log_activity(email, "LOGOUT")
     session.clear()
     return redirect(url_for("client_login"))
 
 # -----------------------------------------------------------------------------
-# OTP API
-# -----------------------------------------------------------------------------
-@app.route("/api/auth/send-otp", methods=["POST"])
-def api_send_otp():
-    data = request.get_json(silent=True) or {}
-    target = str(data.get("target", "")).strip().lower()
-    if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", target):
-        return jsonify({"success": False, "message": "Valid email address is required."}), 400
-    if rate_limited(f"otp:{client_ip()}:{target}", limit=5, window=300):
-        return jsonify({"success": False, "message": "Too many OTP requests. Please try again later."}), 429
-
-    existing = OTP_STORE.get(target)
-    if existing and time.time() - existing.get("created_at", 0) < OTP_RESEND_COOLDOWN:
-        return jsonify({"success": False, "message": "Please wait before requesting another OTP."}), 429
-
-    otp = f"{secrets.randbelow(1_000_000):06d}"
-    OTP_STORE[target] = {"otp": otp, "created_at": time.time(), "attempts": 0}
-    log_activity(target, "OTP_REQUESTED")
-
-    try:
-        success, _msg = send_email_otp(target, otp)
-    except RuntimeError as exc:
-        OTP_STORE.pop(target, None)
-        return jsonify({"success": False, "message": str(exc)}), 500
-    except requests.RequestException:
-        OTP_STORE.pop(target, None)
-        return jsonify({"success": False, "message": "Unable to send OTP right now."}), 502
-
-    if success:
-        return jsonify({"success": True, "message": "OTP has been sent to your email inbox."})
-    OTP_STORE.pop(target, None)
-    return jsonify({"success": False, "message": "Email service rejected the request."}), 502
-
-
-@app.route("/api/auth/verify-otp", methods=["POST"])
-def api_verify_otp():
-    data = request.get_json(silent=True) or {}
-    target = str(data.get("target", "")).strip().lower()
-    otp = str(data.get("otp", "")).strip()
-    entry = OTP_STORE.get(target)
-
-    if not entry or time.time() - entry.get("created_at", 0) > OTP_TTL_SECONDS:
-        OTP_STORE.pop(target, None)
-        return jsonify({"success": False, "message": "Invalid or expired OTP."}), 400
-
-    entry["attempts"] += 1
-    valid = entry["attempts"] <= OTP_MAX_ATTEMPTS and constant_time_equal(entry.get("otp"), otp)
-    if valid:
-        session["verified_email"] = target
-        session.permanent = True
-        OTP_STORE.pop(target, None)
-        log_activity(target, "OTP_VERIFIED_SUCCESS")
-        return jsonify({"success": True, "message": "Email verified successfully."})
-
-    if entry["attempts"] >= OTP_MAX_ATTEMPTS:
-        OTP_STORE.pop(target, None)
-    log_activity(target, "OTP_VERIFY_FAILED")
-    return jsonify({"success": False, "message": "Invalid or expired OTP."}), 400
-
-# -----------------------------------------------------------------------------
-# Google OAuth
+# Google OAuth Flow
 # -----------------------------------------------------------------------------
 @app.route("/connect-google")
-@app.route("/auth/google/connect")
 @login_required
 def google_connect():
-    require_config(("GOOGLE_CLIENT_ID", GOOGLE_CLIENT_ID), ("GOOGLE_CLIENT_SECRET", GOOGLE_CLIENT_SECRET))
-    redirect_uri = configured_redirect_uri()
     state = secrets.token_urlsafe(32)
     session["oauth_state"] = state
     params = {
         "client_id": GOOGLE_CLIENT_ID,
-        "redirect_uri": redirect_uri,
+        "redirect_uri": configured_redirect_uri(),
         "response_type": "code",
         "scope": " ".join(SCOPES),
         "access_type": "offline",
         "prompt": "consent",
         "state": state,
     }
-    auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode(params)
-    return redirect(auth_url)
-
+    return redirect("https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode(params))
 
 @app.route("/oauth2callback")
 def oauth2callback():
-    error = request.args.get("error")
-    if error:
-        return render_template("client_dashboard.html", error=f"Google authorization denied: {error}"), 400
-
     code = request.args.get("code")
-    returned_state = request.args.get("state")
-    expected_state = session.pop("oauth_state", None)
-    if not code or not expected_state or not constant_time_equal(returned_state, expected_state):
-        return render_template("client_dashboard.html", error="Invalid Google OAuth callback."), 400
-
     client_id_session = session.get("client_id")
-    client_email_session = session.get("client_email")
-    if not client_id_session or not client_email_session:
+    if not code or not client_id_session:
         return redirect(url_for("client_login"))
-
-    require_config(("GOOGLE_CLIENT_ID", GOOGLE_CLIENT_ID), ("GOOGLE_CLIENT_SECRET", GOOGLE_CLIENT_SECRET))
-    redirect_uri = configured_redirect_uri()
 
     token_response = requests.post(
         "https://oauth2.googleapis.com/token",
@@ -708,15 +524,14 @@ def oauth2callback():
             "code": code,
             "client_id": GOOGLE_CLIENT_ID,
             "client_secret": GOOGLE_CLIENT_SECRET,
-            "redirect_uri": redirect_uri,
+            "redirect_uri": configured_redirect_uri(),
             "grant_type": "authorization_code",
         },
         timeout=15,
     )
     token_data = token_response.json()
     if token_response.status_code != 200 or "access_token" not in token_data:
-        app.logger.warning("Google OAuth token exchange failed: %s", token_response.text[:500])
-        return render_template("client_dashboard.html", error="Unable to connect Google Drive."), 502
+        return render_template("client_dashboard.html", error="Google Auth failed."), 502
 
     expiry = None
     if token_data.get("expires_in"):
@@ -733,20 +548,15 @@ def oauth2callback():
     cursor = conn.cursor()
     ph = "%s" if db_type == "POSTGRES" else "?"
     try:
-        cursor.execute(
-            f"UPDATE clients SET google_tokens = {ph} WHERE id = {ph}",
-            (json.dumps(stored_token), client_id_session),
-        )
+        cursor.execute(f"UPDATE clients SET google_tokens = {ph} WHERE id = {ph}", (json.dumps(stored_token), client_id_session))
         conn.commit()
-        log_activity(client_email_session, "GOOGLE_DRIVE_CONNECTED")
     finally:
         cursor.close()
         conn.close()
-
     return redirect(url_for("client_dashboard"))
 
 # -----------------------------------------------------------------------------
-# Dashboard / Event upload
+# Studio Dashboard & Event Media Management
 # -----------------------------------------------------------------------------
 @app.route("/client/dashboard")
 @login_required
@@ -758,179 +568,276 @@ def client_dashboard():
     try:
         cursor.execute(f"SELECT id, google_tokens, studio_name FROM clients WHERE id = {ph}", (client_id,))
         client_row = cursor.fetchone()
-        if not client_row:
-            session.clear()
-            return redirect(url_for("client_login"))
-        session["studio_name"] = client_row[2]
-        has_drive = bool(client_row[1])
-        cursor.execute(
-            f"SELECT id, event_id, event_name, event_date, created_at, drive_folder_id FROM events WHERE client_id = {ph} ORDER BY created_at DESC, id DESC",
-            (client_id,),
-        )
+        has_drive = bool(client_row and client_row[1])
+
+        cursor.execute(f"SELECT id, event_id, event_name, event_pin, event_date, created_at, drive_folder_id FROM events WHERE client_id = {ph} ORDER BY created_at DESC", (client_id,))
         events = cursor.fetchall()
-        return render_template("client_dashboard.html", studio_name=session.get("studio_name"), has_drive=has_drive, events=events)
+        return render_template("client_dashboard.html", studio_name=client_row[2], has_drive=has_drive, events=events)
     finally:
         cursor.close()
         conn.close()
 
-
 @app.route("/api/events/create", methods=["POST"])
-@app.route("/client/create-event", methods=["POST"])
 @login_required
 def api_create_event():
-    if rate_limited(f"event-create:{client_ip()}:{session.get('client_id')}", limit=10, window=60):
-        return jsonify({"success": False, "message": "Too many upload requests. Please try again later."}), 429
-
     event_name = (request.form.get("event_name") or request.form.get("event_title") or "").strip()
     if not event_name:
         return jsonify({"success": False, "message": "Event title is required."}), 400
-    if len(event_name) > 200:
-        return jsonify({"success": False, "message": "Event title is too long."}), 400
 
     service = get_drive_service(session["client_id"])
     if not service:
         return jsonify({"success": False, "message": "Please connect your Google Drive first."}), 400
 
-    uploaded_files = [
-        f for f in (request.files.getlist("media_files") or request.files.getlist("files") or request.files.getlist("file"))
-        if f and f.filename
-    ]
+    files = request.files.getlist("media_files") or request.files.getlist("files")
+    uploaded_files = [f for f in files if f and f.filename and allowed_file(f.filename)]
     if not uploaded_files:
-        return jsonify({"success": False, "message": "No media files selected for upload."}), 400
-    if len(uploaded_files) > MAX_FILES_PER_EVENT:
-        return jsonify({"success": False, "message": f"Maximum {MAX_FILES_PER_EVENT} files allowed per event."}), 400
+        return jsonify({"success": False, "message": "No valid media selected."}), 400
 
-    invalid = [f.filename for f in uploaded_files if not allowed_file(f.filename)]
-    if invalid:
-        return jsonify({"success": False, "message": "One or more file types are not allowed."}), 400
+    root_id = get_or_create_root_folder(service)
+    safe_name = re.sub(r"[^\w\- .()&]+", "_", event_name).strip()[:100]
+    folder = service.files().create(
+        body={"name": safe_name, "mimeType": "application/vnd.google-apps.folder", "parents": [root_id]},
+        fields="id",
+    ).execute()
+    event_folder_id = folder["id"]
 
-    safe_event_name = re.sub(r"[^\w\- .()&]+", "_", event_name).strip()[:120] or "Untitled Event"
-
-    try:
-        root_folder_id = get_or_create_root_folder(service)
-        folder_res = service.files().create(
-            body={
-                "name": safe_event_name,
-                "mimeType": "application/vnd.google-apps.folder",
-                "parents": [root_folder_id],
-            },
-            fields="id",
-        ).execute()
-        event_folder_id = folder_res["id"]
-
-        uploaded_count = 0
-        for upload in uploaded_files:
-            file_name = secure_filename(upload.filename)
-            if not file_name:
-                continue
-            upload.stream.seek(0)
-            media = MediaIoBaseUpload(
-                upload.stream,
-                mimetype=upload.content_type or "application/octet-stream",
-                chunksize=1024 * 1024,
-                resumable=True,
-            )
-            service.files().create(
-                body={"name": file_name, "parents": [event_folder_id]},
-                media_body=media,
-                fields="id,name,size",
-            ).execute()
-            uploaded_count += 1
-
-        event_uuid = str(uuid.uuid4())
-        event_date = now_utc().date().isoformat()
-        conn, db_type = get_db_connection()
-        cursor = conn.cursor()
-        try:
-            if db_type == "POSTGRES":
-                cursor.execute(
-                    "INSERT INTO events (id, client_id, event_id, event_name, event_date, drive_folder_id) VALUES (%s,%s,%s,%s,%s,%s)",
-                    (str(uuid.uuid4()), session["client_id"], event_uuid, event_name, event_date, event_folder_id),
-                )
-            else:
-                cursor.execute(
-                    "INSERT INTO events (client_id, event_id, event_name, event_date, drive_folder_id) VALUES (?,?,?,?,?)",
-                    (session["client_id"], event_uuid, event_name, event_date, event_folder_id),
-                )
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            cursor.close()
-            conn.close()
-
-        log_activity(session.get("client_email", "client"), "EVENT_CREATED", f"Event: {event_name}, Files: {uploaded_count}")
-        return jsonify({"success": True, "message": "Event created & synced to Google Drive!", "event_id": event_uuid, "files": uploaded_count})
-
-    except Exception as exc:
-        app.logger.exception("Drive upload error")
-        return jsonify({"success": False, "message": "Upload failed. Please try again."}), 500
-
-# -----------------------------------------------------------------------------
-# Admin portal
-# -----------------------------------------------------------------------------
-@app.route("/admin/activity", methods=["GET", "POST"])
-def admin_activity():
-    if request.method == "POST":
-        if rate_limited(f"admin:{client_ip()}", limit=5, window=300):
-            return render_template("admin_activity.html", error="Too many attempts. Please try later."), 429
-        pin = request.form.get("pin", "")
-        if ADMIN_SECRET_PIN and constant_time_equal(pin, ADMIN_SECRET_PIN):
-            session.clear()
-            session.permanent = True
-            session["is_admin"] = True
-            log_activity("admin", "ADMIN_LOGIN")
-        else:
-            log_activity("admin", "ADMIN_LOGIN_FAILED")
-            return render_template("admin_activity.html", error="Invalid Master PIN", authenticated=False), 401
-
-    if not session.get("is_admin"):
-        return render_template("admin_activity.html", authenticated=False)
+    event_uuid = str(uuid.uuid4())
+    event_pin = f"{secrets.randbelow(9000) + 1000}"
+    event_date = now_utc().date().isoformat()
 
     conn, db_type = get_db_connection()
     cursor = conn.cursor()
+    ph = "%s" if db_type == "POSTGRES" else "?"
+
     try:
-        cursor.execute("SELECT id, studio_name, owner_name, email, phone, created_at FROM clients ORDER BY created_at DESC")
-        clients = cursor.fetchall()
-        cursor.execute("SELECT id, email, action, details, ip_address, timestamp FROM activity_logs ORDER BY id DESC LIMIT 100")
-        logs = cursor.fetchall()
-        return render_template("admin_activity.html", authenticated=True, clients=clients, logs=logs)
+        cursor.execute(
+            f"INSERT INTO events (id, client_id, event_id, event_name, event_pin, event_date, drive_folder_id) VALUES ({ph},{ph},{ph},{ph},{ph},{ph},{ph})",
+            (str(uuid.uuid4()), session["client_id"], event_uuid, event_name, event_pin, event_date, event_folder_id)
+        )
+
+        for up in uploaded_files:
+            fn = secure_filename(up.filename)
+            file_bytes = up.read()
+            up.stream.seek(0)
+            media = MediaIoBaseUpload(BytesIO(file_bytes), mimetype=up.content_type or "application/octet-stream", resumable=True)
+            f_drive = service.files().create(body={"name": fn, "parents": [event_folder_id]}, media_body=media, fields="id").execute()
+
+            # Face extraction if image
+            encodings_json = "[]"
+            if not is_video(fn):
+                faces = extract_face_histograms(file_bytes)
+                encodings_json = json.dumps(faces)
+
+            cursor.execute(
+                f"INSERT INTO event_media (id, event_id, client_id, drive_file_id, file_name, mime_type, face_encodings) VALUES ({ph},{ph},{ph},{ph},{ph},{ph},{ph})",
+                (str(uuid.uuid4()), event_uuid, session["client_id"], f_drive["id"], fn, up.content_type or "image/jpeg", encodings_json)
+            )
+
+        conn.commit()
+        return jsonify({
+            "success": True,
+            "message": "Event created successfully!",
+            "event_id": event_uuid,
+            "event_pin": event_pin,
+            "share_url": f"/event/{event_uuid}"
+        })
     finally:
         cursor.close()
         conn.close()
 
-@app.route("/admin/logout")
-def admin_logout():
-    session.clear()
-    return redirect(url_for("admin_activity"))
+@app.route("/api/events/<event_id>/media", methods=["GET"])
+@login_required
+def api_get_event_media(event_id):
+    """Fetches media list for client dashboard to manage files."""
+    conn, db_type = get_db_connection()
+    cursor = conn.cursor()
+    ph = "%s" if db_type == "POSTGRES" else "?"
+    try:
+        cursor.execute(f"SELECT id, file_name, mime_type, drive_file_id, created_at FROM event_media WHERE event_id = {ph} AND client_id = {ph}", (event_id, session["client_id"]))
+        rows = cursor.fetchall()
+        media_list = [{"id": r[0], "file_name": r[1], "mime_type": r[2], "drive_file_id": r[3], "is_video": is_video(r[1])} for r in rows]
+        return jsonify({"success": True, "media": media_list})
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.route("/api/events/<event_id>/media/add", methods=["POST"])
+@login_required
+def api_insert_event_media(event_id):
+    """Allows client to upload additional photos/videos to an existing event."""
+    service = get_drive_service(session["client_id"])
+    if not service:
+        return jsonify({"success": False, "message": "Drive connection lost."}), 400
+
+    conn, db_type = get_db_connection()
+    cursor = conn.cursor()
+    ph = "%s" if db_type == "POSTGRES" else "?"
+    cursor.execute(f"SELECT drive_folder_id FROM events WHERE event_id = {ph} AND client_id = {ph}", (event_id, session["client_id"]))
+    ev = cursor.fetchone()
+    if not ev:
+        cursor.close(); conn.close()
+        return jsonify({"success": False, "message": "Event not found."}), 404
+
+    folder_id = ev[0]
+    files = request.files.getlist("media_files") or request.files.getlist("files")
+    count = 0
+    try:
+        for up in files:
+            if not up or not allowed_file(up.filename):
+                continue
+            fn = secure_filename(up.filename)
+            file_bytes = up.read()
+            up.stream.seek(0)
+            media = MediaIoBaseUpload(BytesIO(file_bytes), mimetype=up.content_type or "application/octet-stream", resumable=True)
+            f_drive = service.files().create(body={"name": fn, "parents": [folder_id]}, media_body=media, fields="id").execute()
+
+            enc_json = "[]"
+            if not is_video(fn):
+                faces = extract_face_histograms(file_bytes)
+                enc_json = json.dumps(faces)
+
+            cursor.execute(
+                f"INSERT INTO event_media (id, event_id, client_id, drive_file_id, file_name, mime_type, face_encodings) VALUES ({ph},{ph},{ph},{ph},{ph},{ph},{ph})",
+                (str(uuid.uuid4()), event_id, session["client_id"], f_drive["id"], fn, up.content_type or "image/jpeg", enc_json)
+            )
+            count += 1
+        conn.commit()
+        return jsonify({"success": True, "message": f"{count} files added successfully."})
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.route("/api/events/<event_id>/media/<media_id>", methods=["DELETE"])
+@login_required
+def api_delete_event_media(event_id, media_id):
+    """Deletes media from both PostgreSQL and Google Drive."""
+    conn, db_type = get_db_connection()
+    cursor = conn.cursor()
+    ph = "%s" if db_type == "POSTGRES" else "?"
+    try:
+        cursor.execute(f"SELECT drive_file_id FROM event_media WHERE id = {ph} AND event_id = {ph} AND client_id = {ph}", (media_id, event_id, session["client_id"]))
+        row = cursor.fetchone()
+        if not row:
+            return jsonify({"success": False, "message": "Media item not found."}), 404
+        drive_file_id = row[0]
+
+        # Delete from Drive
+        service = get_drive_service(session["client_id"])
+        if service:
+            try:
+                service.files().delete(fileId=drive_file_id).execute()
+            except Exception as e:
+                app.logger.warning("Could not delete from drive: %s", e)
+
+        cursor.execute(f"DELETE FROM event_media WHERE id = {ph}", (media_id,))
+        conn.commit()
+        return jsonify({"success": True, "message": "Media deleted successfully."})
+    finally:
+        cursor.close()
+        conn.close()
 
 # -----------------------------------------------------------------------------
-# Error handling
+# Public Guest Portal & Face Matching Engine
 # -----------------------------------------------------------------------------
-@app.errorhandler(413)
-def request_too_large(_error):
-    if request.path.startswith("/api/"):
-        return jsonify({"success": False, "message": "Uploaded files are too large."}), 413
-    return "Uploaded files are too large.", 413
+@app.route("/event/<event_id>")
+def guest_event_portal(event_id):
+    """Public portal page for guests to enter details and get their photos."""
+    conn, db_type = get_db_connection()
+    cursor = conn.cursor()
+    ph = "%s" if db_type == "POSTGRES" else "?"
+    try:
+        cursor.execute(f"SELECT e.event_name, e.event_date, c.studio_name FROM events e JOIN clients c ON e.client_id = c.id WHERE e.event_id = {ph}", (event_id,))
+        row = cursor.fetchone()
+        if not row:
+            return "Event not found or has been removed.", 404
+        return render_template("guest_portal.html", event_id=event_id, event_name=row[0], event_date=row[1], studio_name=row[2])
+    finally:
+        cursor.close()
+        conn.close()
 
-@app.errorhandler(404)
-def not_found(_error):
-    if request.path.startswith("/api/"):
-        return jsonify({"success": False, "message": "Endpoint not found."}), 404
-    return "Page not found.", 404
+@app.route("/api/event/<event_id>/guest-access", methods=["POST"])
+def api_guest_face_access(event_id):
+    """Collects guest contact details, selfie, validates PIN, and returns only matched media."""
+    name = request.form.get("guest_name", "").strip()
+    phone = request.form.get("guest_phone", "").strip()
+    email = request.form.get("guest_email", "").strip()
+    pin = request.form.get("event_pin", "").strip()
+    selfie = request.files.get("selfie")
 
-@app.errorhandler(Exception)
-def unhandled_exception(error):
-    app.logger.exception("Unhandled application error: %s", error)
-    if request.path.startswith("/api/"):
-        return jsonify({"success": False, "message": "An unexpected server error occurred."}), 500
-    return "An unexpected server error occurred.", 500
+    if not name or not phone or not pin:
+        return jsonify({"success": False, "message": "Name, phone number and PIN are required."}), 400
+
+    conn, db_type = get_db_connection()
+    cursor = conn.cursor()
+    ph = "%s" if db_type == "POSTGRES" else "?"
+    try:
+        # Verify Event & PIN
+        cursor.execute(f"SELECT event_pin, client_id FROM events WHERE event_id = {ph}", (event_id,))
+        ev = cursor.fetchone()
+        if not ev or not constant_time_equal(ev[0], pin):
+            return jsonify({"success": False, "message": "Invalid Event PIN."}), 403
+
+        client_id = ev[1]
+
+        # Extract guest face features
+        guest_enc = None
+        if selfie and selfie.filename:
+            selfie_bytes = selfie.read()
+            selfie_faces = extract_face_histograms(selfie_bytes)
+            if selfie_faces:
+                guest_enc = selfie_faces[0]
+
+        # Save lead to database
+        lead_id = str(uuid.uuid4())
+        cursor.execute(
+            f"INSERT INTO guest_leads (id, event_id, guest_name, guest_phone, guest_email, selfie_encoding) VALUES ({ph},{ph},{ph},{ph},{ph},{ph})",
+            (lead_id, event_id, name, phone, email, json.dumps(guest_enc) if guest_enc else None)
+        )
+        conn.commit()
+
+        # Retrieve all media for this event
+        cursor.execute(f"SELECT id, file_name, mime_type, drive_file_id, face_encodings FROM event_media WHERE event_id = {ph}", (event_id,))
+        rows = cursor.fetchall()
+
+        matched_media = []
+        for r in rows:
+            mid, fn, mime, df_id, f_enc_json = r[0], r[1], r[2], r[3], r[4]
+            # Videos are available for all event guests
+            if is_video(fn):
+                matched_media.append({"id": mid, "file_name": fn, "type": "video", "download_url": f"/media/download/{client_id}/{df_id}/{fn}"})
+            # Photos are filtered by face match
+            elif guest_enc and match_face(guest_enc, f_enc_json):
+                matched_media.append({"id": mid, "file_name": fn, "type": "photo", "download_url": f"/media/download/{client_id}/{df_id}/{fn}"})
+
+        return jsonify({
+            "success": True,
+            "guest_name": name,
+            "matched_count": len(matched_media),
+            "media": matched_media
+        })
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.route("/media/download/<client_id>/<drive_file_id>/<filename>")
+def download_media_stream(client_id, drive_file_id, filename):
+    """Direct high-speed streaming download from Google Drive to guest gallery."""
+    service = get_drive_service(client_id)
+    if not service:
+        return "Authentication error.", 403
+
+    request_file = service.files().get_media(fileId=drive_file_id)
+    fh = BytesIO()
+    downloader = MediaIoBaseDownload(fh, request_file)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    fh.seek(0)
+    return send_file(fh, as_attachment=True, download_name=secure_filename(filename))
 
 # -----------------------------------------------------------------------------
-# Server entry point
+# Entry Point
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
-    debug = os.environ.get("FLASK_DEBUG", "0") == "1"
-    app.run(host="0.0.0.0", port=port, debug=debug)
+    app.run(host="0.0.0.0", port=port, debug=False)
